@@ -209,6 +209,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     allow_categories = [1, 2, 3, 4, 5]
 
     for sample_idx, sample in enumerate(samples):
+        # agent指的并不是真正意义上的agent，而是一个封装了内存系统和LLM控制器的类，
+        # 专门用于这个评测流程。它负责管理记忆系统、生成查询关键词、检索相关记忆，
+        # 并根据问题和上下文生成答案。
+        # 每个样本都会创建一个新的agent实例，以确保记忆系统从头开始构建，避免不同样本之间的记忆干扰。
         agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
                                        sglang_host, sglang_port)
 
