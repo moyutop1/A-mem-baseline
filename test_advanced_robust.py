@@ -101,8 +101,12 @@ Question: {question}
 
 Keywords:"""
 
-        response = self.retriever_llm.llm.get_completion(prompt)
-        result = parse_keywords_response(response)
+        try:
+            response = self.retriever_llm.llm.get_completion(prompt)
+            result = parse_keywords_response(response)
+        except Exception as e:
+            logger.warning("generate_query_llm failed: %s; falling back to original question", e)
+            result = question
         logger.debug("generate_query_llm response: %s", result)
         return result
 

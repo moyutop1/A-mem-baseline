@@ -120,6 +120,8 @@ class RobustOpenAIController(RobustBaseLLMController):
             temperature=temperature,
             max_tokens=1000,
         )
+        if response is None or not getattr(response, "choices", None):
+            raise RuntimeError("OpenAI-compatible backend returned an empty response")
         return response.choices[0].message.content
 
 
