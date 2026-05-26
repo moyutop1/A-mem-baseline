@@ -206,6 +206,81 @@ FOCUSED_KEYWORDS_PROMPT = """List exactly 5 keywords that capture the main conce
 Text: {content}"""
 
 
+MEMORY_RELATION_RESOLUTION_PROMPT = """You are a lifecycle manager for an agent memory system.
+Decide how the new memory candidate should be written relative to existing candidate memories.
+
+Important rules:
+- Do not create update, replace, or conflict graph edges.
+- If the new memory supersedes, conflicts with, or refines an old memory, choose a write-time consolidation action.
+- Only choose create_separate_memory when the new memory should remain an independent active memory.
+- Target is the memory index from the candidates below, or NONE.
+
+Allowed actions:
+- overwrite_existing: newer information clearly supersedes the target memory.
+- refine_conditions: both memories remain valid under different contexts or conditions.
+- append_detail: the new memory adds details to the target memory.
+- create_separate_memory: the new memory belongs to a different entity, topic, or context.
+- mark_candidate_uncertain: the new memory is temporary, ambiguous, or unreliable.
+
+New memory:
+- Content: {content}
+- Context: {context}
+- Keywords: {keywords}
+- Tags: {tags}
+
+Candidate memories:
+{candidate_memories}
+
+Respond using EXACTLY this format:
+ACTION: <one allowed action>
+TARGET: <candidate memory index or NONE>
+RELATION: <same_entity|same_topic|semantic_related|elaborates|evidence_for|generalizes|co_used|none>
+CONFIDENCE: <0.0 to 1.0>
+REASON: <brief explanation>"""
+
+
+MEMORY_REWRITE_PROMPT = """Rewrite an existing memory object at write time.
+The rewritten memory must represent the current valid information. Old versions are kept only in revision history by the system, so do not include revision history in your answer.
+
+Rewrite mode: {mode}
+Resolution reason: {reason}
+
+Existing memory:
+- Content: {old_content}
+- Context: {old_context}
+- Conditions: {old_conditions}
+
+New memory:
+- Content: {new_content}
+- Context: {new_context}
+
+Respond using EXACTLY this format:
+CONTENT: <rewritten current memory content>
+CONDITIONS:
+- context: <condition or scope>
+  detail: <preference/fact/detail>
+DOMAIN_PATHS: path1, path2
+MEMORY_LEVEL: <instance|task|generalized>
+CONFIDENCE: <0.0 to 1.0>
+UPDATE_REASON: <brief reason for the rewrite>"""
+
+
+DOMAIN_RERANK_PROMPT = """Choose the most appropriate memory domains for the text.
+You are given embedding-retrieved candidate domains from a memory domain tree.
+Select up to {max_domains} domains. Prefer the most specific domain path when possible.
+You must select at least one domain from the candidate list.
+
+Text:
+{text}
+
+Candidate domains:
+{candidate_domains}
+
+Respond using EXACTLY this format:
+DOMAINS: domain path 1, domain path 2
+REASON: <brief explanation>"""
+
+
 # ---------------------------------------------------------------------------
 # Parsers for each call site
 # ---------------------------------------------------------------------------
@@ -375,6 +450,172 @@ def parse_update_neighbors(response: str, num_neighbors: int) -> List[Dict[str, 
         pass
 
     return _section_parse(response, num_neighbors)
+
+
+def parse_memory_relation_resolution(response: str) -> Dict[str, Any]:
+    """Parse a write-time memory relation decision."""
+    valid_actions = {
+        "overwrite_existing",
+        "refine_conditions",
+        "append_detail",
+        "create_separate_memory",
+        "mark_candidate_uncertain",
+    }
+    valid_relations = {
+        "semantic_related",
+        "same_topic",
+        "same_entity",
+        "evidence_for",
+        "generalizes",
+        "elaborates",
+        "co_used",
+        "none",
+    }
+
+    def _section_parse(resp: str) -> Dict[str, Any]:
+        action = _extract_section(resp, "ACTION", ["TARGET", "RELATION", "CONFIDENCE", "REASON"])
+        target = _extract_section(resp, "TARGET", ["ACTION", "RELATION", "CONFIDENCE", "REASON"])
+        relation = _extract_section(resp, "RELATION", ["ACTION", "TARGET", "CONFIDENCE", "REASON"])
+        confidence_text = _extract_section(resp, "CONFIDENCE", ["ACTION", "TARGET", "RELATION", "REASON"])
+        reason = _extract_section(resp, "REASON", ["ACTION", "TARGET", "RELATION", "CONFIDENCE"])
+        return {
+            "action": action.strip(),
+            "target": target.strip(),
+            "relation": relation.strip(),
+            "confidence": confidence_text.strip(),
+            "reason": reason.strip(),
+        }
+
+    result = parse_with_json_fallback(response, _section_parse)
+    action = str(result.get("action") or result.get("ACTION") or "").strip().lower()
+    action = action.replace(" ", "_").replace("-", "_")
+    if action not in valid_actions:
+        action = "create_separate_memory"
+
+    raw_target = result.get("target", result.get("TARGET", "NONE"))
+    target = None
+    if raw_target is not None and str(raw_target).strip().upper() != "NONE":
+        match = re.search(r"-?\d+", str(raw_target))
+        if match:
+            target = int(match.group(0))
+
+    relation = str(result.get("relation") or result.get("RELATION") or "semantic_related").strip().lower()
+    relation = relation.replace(" ", "_").replace("-", "_")
+    if relation not in valid_relations:
+        relation = "semantic_related"
+
+    try:
+        confidence = float(result.get("confidence", result.get("CONFIDENCE", 0.6)))
+    except (TypeError, ValueError):
+        confidence = 0.6
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {
+        "action": action,
+        "target": target,
+        "relation": relation,
+        "confidence": confidence,
+        "reason": str(result.get("reason") or result.get("REASON") or "").strip(),
+    }
+
+
+def parse_memory_rewrite(response: str) -> Dict[str, Any]:
+    """Parse a rewritten memory object produced by the lifecycle manager."""
+    def _section_parse(resp: str) -> Dict[str, Any]:
+        content = _extract_section(resp, "CONTENT", ["CONDITIONS", "DOMAIN_PATHS", "MEMORY_LEVEL", "CONFIDENCE", "UPDATE_REASON"])
+        conditions_text = _extract_section(resp, "CONDITIONS", ["DOMAIN_PATHS", "MEMORY_LEVEL", "CONFIDENCE", "UPDATE_REASON"])
+        domain_paths = _extract_section(resp, "DOMAIN_PATHS", ["CONTENT", "CONDITIONS", "MEMORY_LEVEL", "CONFIDENCE", "UPDATE_REASON"])
+        memory_level = _extract_section(resp, "MEMORY_LEVEL", ["CONTENT", "CONDITIONS", "DOMAIN_PATHS", "CONFIDENCE", "UPDATE_REASON"])
+        confidence = _extract_section(resp, "CONFIDENCE", ["CONTENT", "CONDITIONS", "DOMAIN_PATHS", "MEMORY_LEVEL", "UPDATE_REASON"])
+        update_reason = _extract_section(resp, "UPDATE_REASON", ["CONTENT", "CONDITIONS", "DOMAIN_PATHS", "MEMORY_LEVEL", "CONFIDENCE"])
+        return {
+            "content": content.strip(),
+            "conditions": conditions_text.strip(),
+            "domain_paths": domain_paths.strip(),
+            "memory_level": memory_level.strip(),
+            "confidence": confidence.strip(),
+            "update_reason": update_reason.strip(),
+        }
+
+    result = parse_with_json_fallback(response, _section_parse)
+
+    content = str(result.get("content") or result.get("CONTENT") or "").strip()
+    raw_conditions = result.get("conditions", result.get("CONDITIONS", []))
+    if isinstance(raw_conditions, list):
+        conditions = [c for c in raw_conditions if c]
+    else:
+        conditions = []
+        current = {}
+        for line in str(raw_conditions).splitlines():
+            line = re.sub(r"^[\-\*\u2022]\s*", "", line.strip())
+            if not line:
+                continue
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().lower().replace(" ", "_")
+                value = value.strip()
+                if key == "context" and current:
+                    conditions.append(current)
+                    current = {}
+                current[key] = value
+        if current:
+            conditions.append(current)
+
+    raw_paths = result.get("domain_paths", result.get("DOMAIN_PATHS", []))
+    domain_paths = raw_paths if isinstance(raw_paths, list) else _parse_list_items(str(raw_paths))
+
+    memory_level = str(result.get("memory_level", result.get("MEMORY_LEVEL", "instance"))).strip().lower()
+    if memory_level not in {"instance", "task", "generalized"}:
+        memory_level = "instance"
+
+    try:
+        confidence = float(result.get("confidence", result.get("CONFIDENCE", 0.8)))
+    except (TypeError, ValueError):
+        confidence = 0.8
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {
+        "content": content,
+        "conditions": conditions,
+        "domain_paths": domain_paths,
+        "memory_level": memory_level,
+        "confidence": confidence,
+        "update_reason": str(result.get("update_reason") or result.get("UPDATE_REASON") or "").strip(),
+    }
+
+
+def parse_domain_rerank(response: str, valid_domains: List[str], max_domains: int = 3) -> Dict[str, Any]:
+    """Parse an LLM domain rerank response and keep only valid candidate domains."""
+    def _section_parse(resp: str) -> Dict[str, Any]:
+        domains_text = _extract_section(resp, "DOMAINS", ["REASON"])
+        reason_text = _extract_section(resp, "REASON", ["DOMAINS"])
+        return {
+            "domains": _parse_list_items(domains_text),
+            "reason": reason_text.strip(),
+        }
+
+    result = parse_with_json_fallback(response, _section_parse)
+    raw_domains = result.get("domains", result.get("DOMAINS", []))
+    if isinstance(raw_domains, str):
+        raw_domains = _parse_list_items(raw_domains)
+
+    valid_by_lower = {domain.lower(): domain for domain in valid_domains}
+    selected: List[str] = []
+    for domain in raw_domains:
+        domain_text = str(domain).strip()
+        matched = valid_by_lower.get(domain_text.lower())
+        if matched and matched not in selected:
+            selected.append(matched)
+        if len(selected) >= max_domains:
+            break
+
+    if not selected and valid_domains:
+        selected = [valid_domains[0]]
+
+    return {
+        "domains": selected[:max_domains],
+        "reason": str(result.get("reason") or result.get("REASON") or "").strip(),
+    }
 
 
 def parse_plain_text_answer(response: str) -> str:
