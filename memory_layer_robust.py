@@ -703,13 +703,14 @@ class RobustAgenticMemorySystem:
         return note.id
 
     def consolidate_memories(self):
-        """Re-initialize the retriever with current memory state."""
-        try:
-            model_name = self.retriever.model.get_config_dict()['model_name']
-        except (AttributeError, KeyError):
-            model_name = DEFAULT_EMBEDDING_MODEL
+        """Rebuild the retriever index while reusing the already loaded embedding model."""
+        if hasattr(self.retriever, "model"):
+            self.retriever.corpus = []
+            self.retriever.embeddings = None
+            self.retriever.document_ids = {}
+        else:
+            self.retriever = SimpleEmbeddingRetriever(DEFAULT_EMBEDDING_MODEL)
 
-        self.retriever = SimpleEmbeddingRetriever(model_name)
         for memory in self.memories.values():
             if self._is_indexable(memory):
                 self.retriever.add_documents([self._memory_to_index_text(memory)])
