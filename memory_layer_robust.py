@@ -57,6 +57,7 @@ ACTIVE_RETRIEVAL_STATUSES = {"active", "candidate", "stale"}
 DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
+DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 
 UNCERTAIN_MARKERS = {
     "maybe", "might", "possibly", "probably", "not sure", "uncertain",
@@ -284,9 +285,7 @@ class RobustLLMController:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 check_connection: bool = False,
-                 domain_candidate_top_k: int = DEFAULT_DOMAIN_CANDIDATE_TOP_K,
-                 domain_embedding_threshold: float = DEFAULT_DOMAIN_EMBEDDING_THRESHOLD):
+                 check_connection: bool = False):
         if backend == "openai":
             self.llm = RobustOpenAIController(model, api_key)
         elif backend == "ollama":
@@ -423,7 +422,7 @@ class RobustAgenticMemorySystem:
     """Memory management system using plain-text LLM calls (no JSON schema)."""
 
     def __init__(self,
-                 model_name: str = 'all-MiniLM-L6-v2',
+                 model_name: Optional[str] = None,
                  llm_backend: str = "sglang",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
@@ -431,9 +430,12 @@ class RobustAgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 check_connection: bool = False):
+                 check_connection: bool = False,
+                 domain_candidate_top_k: int = DEFAULT_DOMAIN_CANDIDATE_TOP_K,
+                 domain_embedding_threshold: float = DEFAULT_DOMAIN_EMBEDDING_THRESHOLD):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
+        model_name = model_name or DEFAULT_EMBEDDING_MODEL
         self.retriever = SimpleEmbeddingRetriever(model_name)
         self.llm_controller = RobustLLMController(
             llm_backend, llm_model, api_key, api_base,
@@ -705,7 +707,7 @@ class RobustAgenticMemorySystem:
         try:
             model_name = self.retriever.model.get_config_dict()['model_name']
         except (AttributeError, KeyError):
-            model_name = 'all-MiniLM-L6-v2'
+            model_name = DEFAULT_EMBEDDING_MODEL
 
         self.retriever = SimpleEmbeddingRetriever(model_name)
         for memory in self.memories.values():

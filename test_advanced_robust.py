@@ -32,6 +32,8 @@ from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
 
+EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
+
 # Download required NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
@@ -42,7 +44,7 @@ except LookupError:
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
@@ -56,7 +58,7 @@ class RobustAdvancedMemAgent:
     def __init__(self, model, backend, retrieve_k, temperature_c5,
                  sglang_host="http://localhost", sglang_port=30000):
         self.memory_system = RobustAgenticMemorySystem(
-            model_name='all-MiniLM-L6-v2',
+            model_name=EMBEDDING_MODEL_NAME,
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
@@ -239,7 +241,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             else:
                 eval_logger.info(f"No retriever cache found, loading from memory")
                 agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
-                    cached_memories, 'all-MiniLM-L6-v2'
+                    cached_memories, EMBEDDING_MODEL_NAME
                 )
             eval_logger.info(f"Successfully loaded {len(cached_memories)} memories")
         else:
