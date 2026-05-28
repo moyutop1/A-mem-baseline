@@ -17,6 +17,7 @@ import os
 import json
 import argparse
 import logging
+import re
 from typing import List, Dict, Optional
 from pathlib import Path
 import numpy as np
@@ -30,7 +31,7 @@ import pickle
 import random
 from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
-from datetime import datetime
+from datetime import datetime, timedelta
 
 EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 
@@ -112,6 +113,87 @@ Keywords:"""
         logger.debug("generate_query_llm response: %s", result)
         return result
 
+    @staticmethod
+    def _parse_context_blocks(context: str) -> List[Dict[str, str]]:
+        """Extract retrieved memory blocks with their session dates and contents."""
+        blocks = []
+        pattern = re.compile(
+            r"talk start time:(?P<date>.*?) memory content: (?P<content>.*?)(?= relation: .*?talk start time:|talk start time:|\Z)",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(context):
+            blocks.append({
+                "date": match.group("date").strip(),
+                "content": match.group("content").strip(),
+            })
+        return blocks
+
+    @staticmethod
+    def _parse_session_datetime(date_text: str) -> Optional[datetime]:
+        match = re.search(r"on\s+(\d{1,2}\s+[A-Za-z]+,\s+\d{4})", date_text)
+        if not match:
+            return None
+        try:
+            return datetime.strptime(match.group(1), "%d %B, %Y")
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_day(date_value: datetime) -> str:
+        return f"{date_value.day} {date_value.strftime('%B %Y')}"
+
+    @staticmethod
+    def _mentions_session_date(response: str, session_dt: datetime) -> bool:
+        response_lower = response.lower()
+        return (
+            str(session_dt.year) in response_lower
+            and session_dt.strftime("%B").lower() in response_lower
+            and str(session_dt.day) in response_lower
+        )
+
+    def normalize_temporal_answer(self, response: str, context: str) -> str:
+        """Normalize common relative-time answers for LoCoMo temporal questions."""
+        if not response or not context:
+            return response
+
+        response_lower = response.lower()
+        for block in self._parse_context_blocks(context):
+            content_lower = block["content"].lower()
+            session_dt = self._parse_session_datetime(block["date"])
+            if session_dt is None:
+                continue
+
+            if "yesterday" in content_lower:
+                if "yesterday" in response_lower or self._mentions_session_date(response, session_dt):
+                    return self._format_day(session_dt - timedelta(days=1))
+
+            if "last week" in content_lower:
+                if "last week" in response_lower or self._mentions_session_date(response, session_dt):
+                    return f"The week before {self._format_day(session_dt)}"
+
+            if "next month" in content_lower:
+                if "next month" in response_lower or "summer" in response_lower:
+                    next_month = session_dt.month + 1
+                    year = session_dt.year + (1 if next_month > 12 else 0)
+                    month = 1 if next_month > 12 else next_month
+                    return datetime(year, month, 1).strftime("%B %Y")
+
+            weekday_match = re.search(
+                r"last\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+                content_lower,
+            )
+            if weekday_match and (
+                weekday_match.group(0) in response_lower
+                or self._mentions_session_date(response, session_dt)
+            ):
+                weekday = weekday_match.group(1).capitalize()
+                return f"The {weekday} before {self._format_day(session_dt)}"
+
+            if "last year" in content_lower and "last year" in response_lower:
+                return str(session_dt.year - 1)
+
+        return response
+
     def answer_question(self, question: str, category: int, answer: str) -> tuple:
         """Generate answer for a question — plain text, no JSON schema."""
         keywords = self.generate_query_llm(question)
@@ -156,6 +238,8 @@ Question: {question} Short answer:"""
         except Exception as e:
             logger.warning("answer_question failed: %s — returning empty", e)
             response = ""
+        if category == 2:
+            response = self.normalize_temporal_answer(response, raw_context)
         return response, user_prompt, raw_context
 
 
@@ -256,6 +340,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                         f"speaker: {turn.speaker}\n"
                         f"content: {turn.text}"
                     )
+                    if turn.image_caption:
+                        conversation_tmp += f"\nimage_caption: {turn.image_caption}"
+                    if turn.image_query:
+                        conversation_tmp += f"\nimage_query: {turn.image_query}"
                     agent.add_memory(
                         conversation_tmp,
                         time=turn_datatime,

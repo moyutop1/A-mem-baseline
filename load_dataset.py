@@ -25,6 +25,8 @@ class Turn:
     speaker: str
     dia_id: str
     text: str
+    image_caption: Optional[str] = None
+    image_query: Optional[str] = None
 
 @dataclass
 class Session:
@@ -72,7 +74,9 @@ def parse_session(session_data: List[dict], session_id: int, date_time: str) -> 
         turns.append(Turn(
             speaker=turn["speaker"],
             dia_id=turn["dia_id"],
-            text=text
+            text=text,
+            image_caption=turn.get("blip_caption"),
+            image_query=turn.get("query"),
         ))
     return Session(session_id=session_id, date_time=date_time, turns=turns)
 
