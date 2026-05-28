@@ -843,6 +843,19 @@ class RobustAgenticMemorySystem:
             note._requires_reindex = False
             return False, note
 
+        if getattr(note, "memory_level", DEFAULT_MEMORY_LEVEL) == "instance":
+            self.add_stable_graph_edges(
+                note,
+                indices,
+                {
+                    "relation": "semantic_related",
+                    "confidence": 0.6,
+                    "reason": "Instance-level memories are preserved as separate episodic evidence.",
+                },
+            )
+            note._requires_reindex = False
+            return True, note
+
         try:
             decision = self.resolve_memory_relation(note, candidate_memory, indices)
             logger.debug("Write-time memory relation decision: %s", decision)

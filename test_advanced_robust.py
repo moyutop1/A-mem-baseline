@@ -74,8 +74,8 @@ class RobustAdvancedMemAgent:
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
 
-    def add_memory(self, content, time=None):
-        self.memory_system.add_note(content, time=time)
+    def add_memory(self, content, time=None, **kwargs):
+        self.memory_system.add_note(content, time=time, **kwargs)
 
     def retrieve_memory(self, content, k=10):
         return self.memory_system.find_related_memories_raw(content, k=k)
@@ -250,8 +250,25 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             for _, turns in sample.conversation.sessions.items():
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
-                    conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
-                    agent.add_memory(conversation_tmp, time=turn_datatime)
+                    conversation_tmp = (
+                        f"dia_id: {turn.dia_id}\n"
+                        f"session_date: {turn_datatime}\n"
+                        f"speaker: {turn.speaker}\n"
+                        f"content: {turn.text}"
+                    )
+                    agent.add_memory(
+                        conversation_tmp,
+                        time=turn_datatime,
+                        memory_level="instance",
+                        domain_paths=["Conversation Memory / episodic turns"],
+                        conditions=[
+                            {
+                                "dia_id": turn.dia_id,
+                                "session_date": turn_datatime,
+                                "speaker": turn.speaker,
+                            }
+                        ],
+                    )
 
             memories_to_cache = agent.memory_system.memories
             with open(memory_cache_file, 'wb') as f:
@@ -296,6 +313,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "reference": qa.final_answer,
                     "category": qa.category,
                     "metrics": metrics,
+                    "raw_context": raw_context,
+                    "user_prompt": user_prompt,
                 }
                 results.append(result)
 
