@@ -1,6 +1,7 @@
 import re
 import string
 import numpy as np
+import os
 from typing import List, Dict, Union
 import statistics
 from collections import defaultdict
@@ -25,8 +26,11 @@ except Exception as e:
     print(f"Error downloading NLTK data: {e}")
 
 # Initialize SentenceTransformer model (this will be reused)
+EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
+DISABLE_BERTSCORE = os.getenv("DISABLE_BERTSCORE", "0").lower() in {"1", "true", "yes"}
+
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
@@ -67,6 +71,12 @@ def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_bert_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BERTScore for semantic similarity."""
+    if DISABLE_BERTSCORE:
+        return {
+            'bert_precision': 0.0,
+            'bert_recall': 0.0,
+            'bert_f1': 0.0
+        }
     try:
         P, R, F1 = bert_score([prediction], [reference], lang='en', verbose=False)
         return {
