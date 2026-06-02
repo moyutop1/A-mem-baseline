@@ -51,6 +51,7 @@ STABLE_RETRIEVAL_EDGES = {
     "generalizes",
     "elaborates",
     "co_used",
+    "local_context",
 }
 DISALLOWED_GRAPH_EDGES = {"updates", "replaces", "conflicts_with", "update", "replace", "conflict"}
 ACTIVE_RETRIEVAL_STATUSES = {"active", "candidate", "stale"}
@@ -58,6 +59,7 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v2_query_rerank_local_context"
 
 UNCERTAIN_MARKERS = {
     "maybe", "might", "possibly", "probably", "not sure", "uncertain",
@@ -445,17 +447,185 @@ class RobustAgenticMemorySystem:
         self.evo_threshold = evo_threshold
         self.domain_candidate_top_k = max(1, int(domain_candidate_top_k))
         self.domain_embedding_threshold = float(domain_embedding_threshold)
+        self.retrieval_index_version = RETRIEVAL_INDEX_VERSION
+
+    @staticmethod
+    def _parse_memory_fields(content: str) -> Dict[str, str]:
+        field_names = "dia_id|session_date|speaker|content|image_caption|image_query"
+        fields: Dict[str, str] = {}
+        for match in re.finditer(
+            rf"(?:^|\n)(?P<key>{field_names}):\s*(?P<value>.*?)(?=\n(?:{field_names}):|\Z)",
+            str(content),
+            re.DOTALL,
+        ):
+            fields[match.group("key")] = match.group("value").strip()
+        return fields
+
+    @staticmethod
+    def _canonical_token(token: str) -> str:
+        token = token.lower()
+        if len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 4 and token.endswith("ed"):
+            token = token[:-2]
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        return token
+
+    @classmethod
+    def _retrieval_tokens(cls, text: str) -> set:
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "from", "into", "what", "when",
+            "where", "which", "would", "could", "should", "about", "mention", "mentioned",
+            "conversation", "answer", "short", "date", "time", "last", "week", "year",
+            "month", "yesterday", "today", "tomorrow", "before", "after", "did", "does",
+            "was", "were", "has", "have", "had", "their", "they", "them", "his", "her",
+            "him", "she", "you", "your", "are", "any", "all", "who", "why", "how",
+        }
+        return {
+            cls._canonical_token(token)
+            for token in re.findall(r"[A-Za-z0-9]+", str(text).lower())
+            if len(token) >= 3 and token not in stopwords
+        }
+
+    def _lexical_relevance(self, memory: RobustMemoryNote, query: str) -> float:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        main_text = " ".join([
+            fields.get("speaker", ""),
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+            getattr(memory, "context", ""),
+            " ".join(getattr(memory, "keywords", [])),
+            " ".join(getattr(memory, "tags", [])),
+        ])
+        visual_text = " ".join([
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+        ])
+        query_tokens = self._retrieval_tokens(query)
+        if not query_tokens:
+            return 0.0
+        main_tokens = self._retrieval_tokens(main_text)
+        visual_tokens = self._retrieval_tokens(visual_text)
+        main_overlap = len(query_tokens & main_tokens)
+        visual_overlap = len(query_tokens & visual_tokens)
+        coverage = (main_overlap + 0.5 * visual_overlap) / max(1, len(query_tokens))
+        exact_boost = 0.0
+        query_lower = str(query).lower()
+        main_lower = main_text.lower()
+        for phrase in re.split(r"[,;?]+", query_lower):
+            phrase = phrase.strip()
+            if len(phrase) >= 8 and phrase in main_lower:
+                exact_boost += 0.25
+        return (3.0 * main_overlap) + (0.75 * visual_overlap) + coverage + exact_boost
+
+    @staticmethod
+    def _dia_sort_key(dia_id: str) -> Optional[tuple]:
+        match = re.match(r"D(\d+):(\d+)$", str(dia_id).strip())
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2))
+
+    def _dia_id_for_memory(self, memory: RobustMemoryNote) -> Optional[str]:
+        for condition in getattr(memory, "conditions", []) or []:
+            dia_id = condition.get("dia_id") if isinstance(condition, dict) else None
+            if dia_id and self._dia_sort_key(str(dia_id)):
+                return str(dia_id)
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        dia_id = fields.get("dia_id")
+        return dia_id if dia_id and self._dia_sort_key(dia_id) else None
+
+    def _build_dia_lookup(self, memories: List[RobustMemoryNote]) -> Dict[tuple, RobustMemoryNote]:
+        lookup: Dict[tuple, RobustMemoryNote] = {}
+        for memory in memories:
+            memory = self._ensure_memory_schema(memory)
+            dia_id = self._dia_id_for_memory(memory)
+            sort_key = self._dia_sort_key(dia_id) if dia_id else None
+            if sort_key:
+                lookup[sort_key] = memory
+        return lookup
+
+    def _local_context_neighbors(
+        self,
+        memory: RobustMemoryNote,
+        dia_lookup: Dict[tuple, RobustMemoryNote],
+        radius: int = 2,
+    ) -> List[RobustMemoryNote]:
+        dia_id = self._dia_id_for_memory(memory)
+        sort_key = self._dia_sort_key(dia_id) if dia_id else None
+        if not sort_key:
+            return []
+        session_idx, turn_idx = sort_key
+        neighbors = []
+        for distance in range(1, radius + 1):
+            for neighbor_key in ((session_idx, turn_idx - distance), (session_idx, turn_idx + distance)):
+                neighbor = dia_lookup.get(neighbor_key)
+                if neighbor:
+                    neighbors.append(neighbor)
+        return neighbors
+
+    def _retrieval_candidates(
+        self,
+        query: str,
+        k: int,
+        routed_domains: Optional[List[str]],
+    ) -> List[tuple]:
+        search_k = min(max(k * 10, 40), max(k, len(self.memories)))
+        indices = self.retriever.search(query, search_k)
+        all_memories = list(self.memories.values())
+        ranked = []
+        for order, i in enumerate(indices):
+            if i >= len(all_memories):
+                continue
+            memory = self._ensure_memory_schema(all_memories[i])
+            if not self._is_retrievable(memory, query):
+                continue
+            if not self._domain_overlap(memory, routed_domains):
+                continue
+            lexical_score = self._lexical_relevance(memory, query)
+            ranked.append((self.lifecycle_penalty(memory), -lexical_score, order, i, memory))
+
+        if not ranked and routed_domains:
+            for order, i in enumerate(indices):
+                if i >= len(all_memories):
+                    continue
+                memory = self._ensure_memory_schema(all_memories[i])
+                if not self._is_retrievable(memory, query):
+                    continue
+                lexical_score = self._lexical_relevance(memory, query)
+                ranked.append((self.lifecycle_penalty(memory) + 0.1, -lexical_score, order, i, memory))
+
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+        return ranked
 
     def _memory_to_index_text(self, memory: RobustMemoryNote) -> str:
-        """Build the retriever document from the current valid memory object."""
-        return (
-            "content:" + getattr(memory, "current_content", memory.content) +
-            " context:" + getattr(memory, "context", "General") +
-            " keywords: " + ", ".join(getattr(memory, "keywords", [])) +
-            " tags: " + ", ".join(getattr(memory, "tags", [])) +
-            " domains: " + ", ".join(getattr(memory, "domain_paths", [])) +
-            " status: " + getattr(memory, "status", "active")
-        )
+        """Build a weighted retriever document from the current valid memory object."""
+        current_content = getattr(memory, "current_content", memory.content)
+        fields = self._parse_memory_fields(current_content)
+        main_content = fields.get("content", current_content)
+        visual_cues = " ".join([
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+        ]).strip()
+        metadata = " ".join([
+            fields.get("dia_id", ""),
+            fields.get("session_date", ""),
+            fields.get("speaker", ""),
+            getattr(memory, "context", "General"),
+            " ".join(getattr(memory, "keywords", [])),
+            " ".join(getattr(memory, "tags", [])),
+            " ".join(getattr(memory, "domain_paths", [])),
+        ]).strip()
+        pieces = [
+            "content: " + main_content,
+            "content: " + main_content,
+            "metadata: " + metadata,
+            "status: " + getattr(memory, "status", "active"),
+        ]
+        if visual_cues:
+            pieces.append("visual cue: " + visual_cues)
+        return " ".join(piece for piece in pieces if piece.strip())
 
     def _domain_query_text(self, text: str, note: Optional[RobustMemoryNote] = None) -> str:
         if note is None:
@@ -728,32 +898,11 @@ class RobustAgenticMemorySystem:
 
         if route_domain and routed_domains is None:
             routed_domains = self.route_domains(query)
-        indices = self.retriever.search(query, min(k * 3, max(k, len(self.memories))))
         all_memories = list(self.memories.values())
         memory_str = ""
-        ranked = []
-        for order, i in enumerate(indices):
-            if i >= len(all_memories):
-                continue
-            memory = self._ensure_memory_schema(all_memories[i])
-            if not self._is_retrievable(memory, query):
-                continue
-            if not self._domain_overlap(memory, routed_domains):
-                continue
-            ranked.append((self.lifecycle_penalty(memory), order, i, memory))
-
-        if not ranked and routed_domains:
-            for order, i in enumerate(indices):
-                if i >= len(all_memories):
-                    continue
-                memory = self._ensure_memory_schema(all_memories[i])
-                if not self._is_retrievable(memory, query):
-                    continue
-                ranked.append((self.lifecycle_penalty(memory) + 0.1, order, i, memory))
-
-        ranked.sort(key=lambda item: (item[0], item[1]))
+        ranked = self._retrieval_candidates(query, k, routed_domains)
         filtered_indices = []
-        for _, _, i, memory in ranked[:k]:
+        for _, _, _, i, memory in ranked[:k]:
             filtered_indices.append(i)
             memory_str += (
                 "memory index:" + str(i) +
@@ -781,37 +930,30 @@ class RobustAgenticMemorySystem:
 
         if route_domain and routed_domains is None:
             routed_domains = self.route_domains(query)
-        indices = self.retriever.search(query, min(k * 3, max(k, len(self.memories))))
         all_memories = list(self.memories.values())
         id_to_memory = {memory.id: self._ensure_memory_schema(memory) for memory in all_memories}
+        dia_lookup = self._build_dia_lookup(all_memories)
         memory_str = ""
         seen_ids = set()
-        ranked = []
-        for order, i in enumerate(indices):
-            if i >= len(all_memories):
-                continue
-            memory = self._ensure_memory_schema(all_memories[i])
-            if not self._is_retrievable(memory, query):
-                continue
-            if not self._domain_overlap(memory, routed_domains):
-                continue
-            ranked.append((self.lifecycle_penalty(memory), order, i, memory))
-
-        if not ranked and routed_domains:
-            for order, i in enumerate(indices):
-                if i >= len(all_memories):
-                    continue
-                memory = self._ensure_memory_schema(all_memories[i])
-                if not self._is_retrievable(memory, query):
-                    continue
-                ranked.append((self.lifecycle_penalty(memory) + 0.1, order, i, memory))
-
-        ranked.sort(key=lambda item: (item[0], item[1]))
-        for _, _, i, memory in ranked:
+        ranked = self._retrieval_candidates(query, k, routed_domains)
+        primary_count = 0
+        max_context_blocks = max(k, k * 2)
+        for _, _, _, i, memory in ranked:
             if memory.id in seen_ids:
                 continue
             seen_ids.add(memory.id)
             memory_str += self._format_memory_for_context(memory)
+            primary_count += 1
+
+            for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
+                if (
+                    not self._is_retrievable(target_memory, query)
+                    or target_memory.id in seen_ids
+                    or len(seen_ids) >= max_context_blocks
+                ):
+                    continue
+                seen_ids.add(target_memory.id)
+                memory_str += self._format_memory_for_context(target_memory, relation="local_context")
 
             neighbor_count = 0
             for edge in getattr(memory, "links", []):
@@ -828,9 +970,9 @@ class RobustAgenticMemorySystem:
                 seen_ids.add(target_memory.id)
                 memory_str += self._format_memory_for_context(target_memory, relation=relation)
                 neighbor_count += 1
-                if neighbor_count >= k:
+                if neighbor_count >= k or len(seen_ids) >= max_context_blocks:
                     break
-            if len(seen_ids) >= k:
+            if primary_count >= k or len(seen_ids) >= max_context_blocks:
                 break
         return memory_str
 

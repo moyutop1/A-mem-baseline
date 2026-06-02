@@ -7,7 +7,11 @@ Usage:
     python test_advanced_robust.py --backend ollama --model qwen2.5:3b --dataset data/locomo10.json
 """
 
-from memory_layer_robust import RobustLLMController, RobustAgenticMemorySystem
+from memory_layer_robust import (
+    RETRIEVAL_INDEX_VERSION,
+    RobustLLMController,
+    RobustAgenticMemorySystem,
+)
 from llm_text_parsers import (
     parse_plain_text_answer,
     parse_relevant_parts,
@@ -396,22 +400,38 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         retriever_cache_embeddings_file = os.path.join(
             memories_dir, f"retriever_cache_embeddings_sample_{sample_idx}.npy"
         )
+        retriever_cache_version_file = os.path.join(
+            memories_dir, f"retriever_cache_version_sample_{sample_idx}.txt"
+        )
 
         if os.path.exists(memory_cache_file):
             eval_logger.info(f"Loading cached memories for sample {sample_idx}")
             with open(memory_cache_file, 'rb') as f:
                 cached_memories = pickle.load(f)
             agent.memory_system.memories = cached_memories
-            if os.path.exists(retriever_cache_file):
+            cache_version = None
+            if os.path.exists(retriever_cache_version_file):
+                with open(retriever_cache_version_file, 'r') as f:
+                    cache_version = f.read().strip()
+            retriever_cache_is_current = (
+                cache_version == RETRIEVAL_INDEX_VERSION
+                and os.path.exists(retriever_cache_file)
+                and os.path.exists(retriever_cache_embeddings_file)
+            )
+            if retriever_cache_is_current:
                 eval_logger.info(f"Found retriever cache files")
                 agent.memory_system.retriever = agent.memory_system.retriever.load(
                     retriever_cache_file, retriever_cache_embeddings_file
                 )
             else:
-                eval_logger.info(f"No retriever cache found, loading from memory")
-                agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
-                    cached_memories, EMBEDDING_MODEL_NAME
+                eval_logger.info(
+                    f"Retriever cache missing or stale "
+                    f"(found={cache_version}, expected={RETRIEVAL_INDEX_VERSION}); rebuilding"
                 )
+                agent.memory_system.consolidate_memories()
+                agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+                with open(retriever_cache_version_file, 'w') as f:
+                    f.write(RETRIEVAL_INDEX_VERSION)
             eval_logger.info(f"Successfully loaded {len(cached_memories)} memories")
         else:
             eval_logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
@@ -447,6 +467,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             with open(memory_cache_file, 'wb') as f:
                 pickle.dump(memories_to_cache, f)
             agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+            with open(retriever_cache_version_file, 'w') as f:
+                f.write(RETRIEVAL_INDEX_VERSION)
             eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories")
 
         eval_logger.info(f"Processing sample {sample_idx + 1}/{len(samples)}")
