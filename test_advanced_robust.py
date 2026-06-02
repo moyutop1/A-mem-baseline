@@ -18,7 +18,7 @@ import json
 import argparse
 import logging
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from pathlib import Path
 import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
@@ -129,6 +129,91 @@ Keywords:"""
         return blocks
 
     @staticmethod
+    def _memory_body(content: str) -> str:
+        return content.split(" memory context:", 1)[0]
+
+    @staticmethod
+    def _parse_memory_fields(content: str) -> Dict[str, str]:
+        body = RobustAdvancedMemAgent._memory_body(content)
+        field_names = "dia_id|session_date|speaker|content|image_caption|image_query"
+        fields = {}
+        for match in re.finditer(
+            rf"(?:^|\n)(?P<key>{field_names}):\s*(?P<value>.*?)(?=\n(?:{field_names}):|\Z)",
+            body,
+            re.DOTALL,
+        ):
+            fields[match.group("key")] = match.group("value").strip()
+        return fields
+
+    @staticmethod
+    def _extract_retrieved_dia_ids(context: str) -> List[str]:
+        seen = set()
+        dia_ids = []
+        for match in re.finditer(r"dia_id:\s*(D\d+:\d+)", context):
+            dia_id = match.group(1)
+            if dia_id not in seen:
+                seen.add(dia_id)
+                dia_ids.append(dia_id)
+        return dia_ids
+
+    @staticmethod
+    def _overlap_tokens(text: str) -> Set[str]:
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "from", "into", "what", "when",
+            "where", "which", "would", "could", "should", "about", "mention", "mentioned",
+            "conversation", "answer", "short", "date", "time", "last", "week", "year",
+            "month", "yesterday", "today", "tomorrow", "before", "after", "did", "does",
+            "was", "were", "has", "have", "had", "her", "his", "their", "they", "she",
+            "him", "caroline", "melanie",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", text.lower())
+            if len(token) >= 3 and token not in stopwords
+        }
+
+    def _score_temporal_block(self, block: Dict[str, str], question: str, response: str) -> int:
+        fields = self._parse_memory_fields(block["content"])
+        main_text = " ".join([
+            fields.get("content", ""),
+            fields.get("speaker", ""),
+        ])
+        metadata_text = " ".join([
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+            fields.get("dia_id", ""),
+        ])
+        question_tokens = self._overlap_tokens(question)
+        response_tokens = self._overlap_tokens(response)
+        main_tokens = self._overlap_tokens(main_text)
+        metadata_tokens = self._overlap_tokens(metadata_text)
+        return (
+            3 * len(question_tokens & main_tokens)
+            + len(question_tokens & metadata_tokens)
+            + 2 * len(response_tokens & main_tokens)
+            + len(response_tokens & metadata_tokens)
+        )
+
+    def _rank_temporal_blocks(
+        self,
+        context: str,
+        question: str,
+        response: str,
+    ) -> List[Dict[str, str]]:
+        scored = []
+        for order, block in enumerate(self._parse_context_blocks(context)):
+            score = self._score_temporal_block(block, question, response)
+            if score > 0:
+                scored.append((score, order, block))
+        if not scored:
+            return []
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score = scored[0][0]
+        if best_score < 3:
+            return []
+        return [block for score, _, block in scored if score >= max(3, best_score - 2)]
+
+    @staticmethod
     def _parse_session_datetime(date_text: str) -> Optional[datetime]:
         match = re.search(r"on\s+(\d{1,2}\s+[A-Za-z]+,\s+\d{4})", date_text)
         if not match:
@@ -151,13 +236,13 @@ Keywords:"""
             and str(session_dt.day) in response_lower
         )
 
-    def normalize_temporal_answer(self, response: str, context: str) -> str:
+    def normalize_temporal_answer(self, response: str, context: str, question: str) -> str:
         """Normalize common relative-time answers for LoCoMo temporal questions."""
         if not response or not context:
             return response
 
         response_lower = response.lower()
-        for block in self._parse_context_blocks(context):
+        for block in self._rank_temporal_blocks(context, question, response):
             content_lower = block["content"].lower()
             session_dt = self._parse_session_datetime(block["date"])
             if session_dt is None:
@@ -239,7 +324,7 @@ Question: {question} Short answer:"""
             logger.warning("answer_question failed: %s — returning empty", e)
             response = ""
         if category == 2:
-            response = self.normalize_temporal_answer(response, raw_context)
+            response = self.normalize_temporal_answer(response, raw_context, question)
         return response, user_prompt, raw_context
 
 
@@ -403,6 +488,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "metrics": metrics,
                     "raw_context": raw_context,
                     "user_prompt": user_prompt,
+                    "retrieved_dia_ids": agent._extract_retrieved_dia_ids(raw_context),
                 }
                 results.append(result)
 
