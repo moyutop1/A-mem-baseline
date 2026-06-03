@@ -310,7 +310,10 @@ Please generate the shortest possible answer, using words from the conversation 
 Question: {question} Short answer:"""
             temperature = 0.7
         elif category == 3:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
+            user_prompt = f"""Based on the context: {context}, answer the following inference question.
+Category 3 questions often require a brief judgment, likely preference, trait, field, belief, or other inference from the evidence.
+Give the shortest natural answer that best matches the implied meaning, even if the answer uses synonyms or a concise abstraction rather than exact words from the context.
+If the answer is yes/no, include only the short answer unless a very brief qualifier is needed.
 
 Question: {question} Short answer:"""
             temperature = 0.7
@@ -353,7 +356,8 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
 def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None,
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
-                     sglang_host: str = "http://localhost", sglang_port: int = 30000):
+                     sglang_host: str = "http://localhost", sglang_port: int = 30000,
+                     allow_categories: Optional[List[int]] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -385,7 +389,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "cached_memories_robust_{}_{}".format(backend, model),
     )
     os.makedirs(memories_dir, exist_ok=True)
-    allow_categories = [1, 2, 3, 4, 5]
+    allow_categories = allow_categories or [1, 2, 3, 4, 5]
+    eval_logger.info(f"Evaluating categories: {allow_categories}")
 
     for sample_idx, sample in enumerate(samples):
         # agent指的并不是真正意义上的agent，而是一个封装了内存系统和LLM控制器的类，
@@ -572,6 +577,8 @@ def main():
                         help="Temperature for category 5 questions")
     parser.add_argument("--retrieve_k", type=int, default=10,
                         help="Number of memories to retrieve")
+    parser.add_argument("--categories", type=str, default=None,
+                        help="Comma-separated categories to evaluate, e.g. '3' or '1,3'")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
@@ -581,13 +588,24 @@ def main():
     if args.ratio <= 0.0 or args.ratio > 1.0:
         raise ValueError("Ratio must be between 0.0 and 1.0")
 
+    allow_categories = None
+    if args.categories:
+        allow_categories = [
+            int(category.strip())
+            for category in args.categories.split(",")
+            if category.strip()
+        ]
+        invalid_categories = [category for category in allow_categories if category not in [1, 2, 3, 4, 5]]
+        if invalid_categories:
+            raise ValueError(f"Invalid categories: {invalid_categories}")
+
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
     output_path = os.path.join(os.path.dirname(__file__), args.output) if args.output else None
 
     evaluate_dataset(
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
-        args.sglang_host, args.sglang_port,
+        args.sglang_host, args.sglang_port, allow_categories,
     )
 
 
