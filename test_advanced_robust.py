@@ -85,6 +85,14 @@ class RobustAdvancedMemAgent:
     def retrieve_memory(self, content, k=10):
         return self.memory_system.find_related_memories_raw(content, k=k)
 
+    @staticmethod
+    def build_retrieval_query(question: str, keywords: str) -> str:
+        """Keep the original question in retrieval so keyword drift cannot erase key evidence."""
+        parts = [question.strip()]
+        if keywords and keywords.strip() and keywords.strip().lower() != question.strip().lower():
+            parts.append(keywords.strip())
+        return " ; ".join(parts)
+
     def retrieve_memory_llm(self, memories_text, query):
         """Select relevant parts of conversation memories — plain text, no JSON schema."""
         prompt = f"""Given the following conversation memories and a question, select the most relevant parts of the conversation that would help answer the question. Include the date/time if available.
@@ -232,6 +240,25 @@ Keywords:"""
         return f"{date_value.day} {date_value.strftime('%B %Y')}"
 
     @staticmethod
+    def _canonical_weekday(raw_weekday: str) -> str:
+        weekday = raw_weekday.lower().rstrip(".")
+        if weekday.startswith("mon"):
+            return "Monday"
+        if weekday.startswith("tue"):
+            return "Tuesday"
+        if weekday.startswith("wed"):
+            return "Wednesday"
+        if weekday.startswith("thu"):
+            return "Thursday"
+        if weekday.startswith("fri"):
+            return "Friday"
+        if weekday.startswith("sat"):
+            return "Saturday"
+        if weekday.startswith("sun"):
+            return "Sunday"
+        return raw_weekday.capitalize()
+
+    @staticmethod
     def _mentions_session_date(response: str, session_dt: datetime) -> bool:
         response_lower = response.lower()
         return (
@@ -267,15 +294,19 @@ Keywords:"""
                     month = 1 if next_month > 12 else next_month
                     return datetime(year, month, 1).strftime("%B %Y")
 
+            if "this month" in content_lower:
+                if "this month" in response_lower or self._mentions_session_date(response, session_dt):
+                    return session_dt.strftime("%B %Y")
+
             weekday_match = re.search(
-                r"last\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+                r"last\s+(mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:rs(?:day)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\.?",
                 content_lower,
             )
             if weekday_match and (
-                weekday_match.group(0) in response_lower
+                "last" in response_lower
                 or self._mentions_session_date(response, session_dt)
             ):
-                weekday = weekday_match.group(1).capitalize()
+                weekday = self._canonical_weekday(weekday_match.group(1))
                 return f"The {weekday} before {self._format_day(session_dt)}"
 
             if "last year" in content_lower and "last year" in response_lower:
@@ -286,8 +317,14 @@ Keywords:"""
     def answer_question(self, question: str, category: int, answer: str) -> tuple:
         """Generate answer for a question — plain text, no JSON schema."""
         keywords = self.generate_query_llm(question)
-        raw_context = self.retrieve_memory(keywords, k=self.retrieve_k)
+        retrieval_query = self.build_retrieval_query(question, keywords)
+        raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k)
         context = raw_context
+        evidence_instruction = (
+            "Use the most directly relevant memory blocks for the question. "
+            "Blocks marked relation: local_context are nearby conversational context; use them only when they clarify a directly relevant block. "
+            "Ignore unrelated memories even if they share broad topics."
+        )
 
         assert category in [1, 2, 3, 4, 5]
 
@@ -299,18 +336,18 @@ Keywords:"""
             else:
                 answer_tmp.append(answer)
                 answer_tmp.append('Not mentioned in the conversation')
-            user_prompt = f"""Based on the context: {context}, answer the following question. {question}
+            user_prompt = f"""Based on the context: {context}, answer the following question. {evidence_instruction} {question}
 
 Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}  Short answer:"""
             temperature = self.temperature_c5
         elif category == 2:
-            user_prompt = f"""Based on the context: {context}, answer the following question. Use DATE of CONVERSATION to answer with an approximate date.
+            user_prompt = f"""Based on the context: {context}, answer the following question. {evidence_instruction} Use DATE of CONVERSATION to answer with an approximate date.
 Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.
 
 Question: {question} Short answer:"""
             temperature = 0.7
         elif category == 3:
-            user_prompt = f"""Based on the context: {context}, answer the following inference question.
+            user_prompt = f"""Based on the context: {context}, answer the following inference question. {evidence_instruction}
 Category 3 questions often require a brief judgment, likely preference, trait, field, belief, or other inference from the evidence.
 Give the shortest natural answer that best matches the implied meaning, even if the answer uses synonyms or a concise abstraction rather than exact words from the context.
 If the answer is yes/no, include only the short answer unless a very brief qualifier is needed.
@@ -318,7 +355,7 @@ If the answer is yes/no, include only the short answer unless a very brief quali
 Question: {question} Short answer:"""
             temperature = 0.7
         else:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
+            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. {evidence_instruction} Answer with exact words from the context whenever possible.
 
 Question: {question} Short answer:"""
             temperature = 0.7

@@ -937,23 +937,27 @@ class RobustAgenticMemorySystem:
         seen_ids = set()
         ranked = self._retrieval_candidates(query, k, routed_domains)
         primary_count = 0
-        max_context_blocks = max(k, k * 2)
-        for _, _, _, i, memory in ranked:
+        max_context_blocks = max(k, k + 6)
+        local_context_primary_limit = 3
+        local_context_min_lexical_score = 1.0
+        for _, negative_lexical_score, _, i, memory in ranked:
             if memory.id in seen_ids:
                 continue
             seen_ids.add(memory.id)
             memory_str += self._format_memory_for_context(memory)
             primary_count += 1
 
-            for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
-                if (
-                    not self._is_retrievable(target_memory, query)
-                    or target_memory.id in seen_ids
-                    or len(seen_ids) >= max_context_blocks
-                ):
-                    continue
-                seen_ids.add(target_memory.id)
-                memory_str += self._format_memory_for_context(target_memory, relation="local_context")
+            lexical_score = -negative_lexical_score
+            if primary_count <= local_context_primary_limit and lexical_score >= local_context_min_lexical_score:
+                for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
+                    if (
+                        not self._is_retrievable(target_memory, query)
+                        or target_memory.id in seen_ids
+                        or len(seen_ids) >= max_context_blocks
+                    ):
+                        continue
+                    seen_ids.add(target_memory.id)
+                    memory_str += self._format_memory_for_context(target_memory, relation="local_context")
 
             neighbor_count = 0
             for edge in getattr(memory, "links", []):
