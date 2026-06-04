@@ -61,7 +61,8 @@ class RobustAdvancedMemAgent:
     """Agent using the robust memory system with plain-text LLM calls."""
 
     def __init__(self, model, backend, retrieve_k, temperature_c5,
-                 sglang_host="http://localhost", sglang_port=30000):
+                 sglang_host="http://localhost", sglang_port=30000,
+                 compress_context: bool = False):
         self.memory_system = RobustAgenticMemorySystem(
             model_name=EMBEDDING_MODEL_NAME,
             llm_backend=backend,
@@ -78,6 +79,7 @@ class RobustAdvancedMemAgent:
         )
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
+        self.compress_context = compress_context
 
     def add_memory(self, content, time=None, **kwargs):
         self.memory_system.add_note(content, time=time, **kwargs)
@@ -93,7 +95,7 @@ class RobustAdvancedMemAgent:
             parts.append(keywords.strip())
         return " ; ".join(parts)
 
-    def retrieve_memory_llm(self, memories_text, query):
+    def _retrieve_memory_llm_legacy(self, memories_text, query):
         """Select relevant parts of conversation memories — plain text, no JSON schema."""
         prompt = f"""Given the following conversation memories and a question, select the most relevant parts of the conversation that would help answer the question. Include the date/time if available.
 
@@ -107,6 +109,29 @@ If no parts are relevant, return the input unchanged."""
 
         response = self.retriever_llm.llm.get_completion(prompt)
         return parse_relevant_parts(response)
+
+    def retrieve_memory_llm(self, memories_text, query):
+        """Compress retrieved memories into the most relevant evidence for answering."""
+        prompt = f"""Given the following conversation memories and a question, select the most relevant evidence blocks that would help answer the question.
+Preserve dia_id, session_date, speaker, and exact quoted facts when available.
+Prefer directly relevant blocks over broad topical matches.
+Use local_context blocks only when they clarify a directly relevant block.
+
+Conversation memories:
+{memories_text}
+
+Question: {query}
+
+Return 3-6 concise evidence lines.
+If no parts are relevant, return the input unchanged."""
+
+        try:
+            response = self.retriever_llm.llm.get_completion(prompt, temperature=0.1)
+            compressed = parse_relevant_parts(response)
+        except Exception as e:
+            logger.warning("retrieve_memory_llm failed: %s; using raw retrieved context", e)
+            return memories_text
+        return compressed or memories_text
 
     def generate_query_llm(self, question):
         """Generate query keywords — plain text, no JSON schema."""
@@ -319,7 +344,11 @@ Keywords:"""
         keywords = self.generate_query_llm(question)
         retrieval_query = self.build_retrieval_query(question, keywords)
         raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k)
-        context = raw_context
+        context = (
+            self.retrieve_memory_llm(raw_context, question)
+            if self.compress_context
+            else raw_context
+        )
         evidence_instruction = (
             "Use the most directly relevant memory blocks for the question. "
             "Blocks marked relation: local_context are nearby conversational context; use them only when they clarify a directly relevant block. "
@@ -349,11 +378,12 @@ Question: {question} Short answer:"""
         elif category == 3:
             user_prompt = f"""Based on the context: {context}, answer the following inference question. {evidence_instruction}
 Category 3 questions often require a brief judgment, likely preference, trait, field, belief, or other inference from the evidence.
-Give the shortest natural answer that best matches the implied meaning, even if the answer uses synonyms or a concise abstraction rather than exact words from the context.
-If the answer is yes/no, include only the short answer unless a very brief qualifier is needed.
+Give a concise answer that best matches the implied meaning. When the question asks for a likely yes/no judgment, answer with "Likely yes/no; brief reason" if the evidence supports a reason.
+When the answer is a named holiday, book, place, person, or other proper term found in the context, preserve the wording from the context.
+For traits, preferences, likely fields, beliefs, or status, include 2-4 words or a very short reason rather than a bare yes/no.
 
 Question: {question} Short answer:"""
-            temperature = 0.7
+            temperature = 0.3
         else:
             user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. {evidence_instruction} Answer with exact words from the context whenever possible.
 
@@ -394,7 +424,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      ratio: float = 1.0, backend: str = "sglang",
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
-                     allow_categories: Optional[List[int]] = None):
+                     allow_categories: Optional[List[int]] = None,
+                     compress_context: bool = False):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -428,6 +459,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = allow_categories or [1, 2, 3, 4, 5]
     eval_logger.info(f"Evaluating categories: {allow_categories}")
+    eval_logger.info(f"Compressing retrieved context: {compress_context}")
 
     for sample_idx, sample in enumerate(samples):
         # agent指的并不是真正意义上的agent，而是一个封装了内存系统和LLM控制器的类，
@@ -435,7 +467,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         # 并根据问题和上下文生成答案。
         # 每个样本都会创建一个新的agent实例，以确保记忆系统从头开始构建，避免不同样本之间的记忆干扰。
         agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                       sglang_host, sglang_port)
+                                       sglang_host, sglang_port, compress_context)
 
         memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
         retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
@@ -565,6 +597,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "model": model,
         "dataset": dataset_path,
         "memory_layer": "robust",
+        "compress_context": compress_context,
         "total_questions": total_questions,
         "category_distribution": {
             str(cat): count for cat, count in category_counts.items()
@@ -616,6 +649,8 @@ def main():
                         help="Number of memories to retrieve")
     parser.add_argument("--categories", type=str, default=None,
                         help="Comma-separated categories to evaluate, e.g. '3' or '1,3'")
+    parser.add_argument("--compress_context", action="store_true",
+                        help="Use an extra LLM pass to compress retrieved memories into evidence before answering")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
@@ -643,6 +678,7 @@ def main():
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port, allow_categories,
+        args.compress_context,
     )
 
 
