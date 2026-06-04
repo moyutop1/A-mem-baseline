@@ -62,7 +62,7 @@ class RobustAdvancedMemAgent:
 
     def __init__(self, model, backend, retrieve_k, temperature_c5,
                  sglang_host="http://localhost", sglang_port=30000,
-                 compress_context: bool = False):
+                 compress_categories: Optional[Set[int]] = None):
         self.memory_system = RobustAgenticMemorySystem(
             model_name=EMBEDDING_MODEL_NAME,
             llm_backend=backend,
@@ -79,7 +79,7 @@ class RobustAdvancedMemAgent:
         )
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
-        self.compress_context = compress_context
+        self.compress_categories = compress_categories or set()
 
     def add_memory(self, content, time=None, **kwargs):
         self.memory_system.add_note(content, time=time, **kwargs)
@@ -346,7 +346,7 @@ Keywords:"""
         raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k)
         context = (
             self.retrieve_memory_llm(raw_context, question)
-            if self.compress_context
+            if int(category) in self.compress_categories
             else raw_context
         )
         evidence_instruction = (
@@ -425,7 +425,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
                      allow_categories: Optional[List[int]] = None,
-                     compress_context: bool = False):
+                     compress_categories: Optional[Set[int]] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -458,8 +458,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     )
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = allow_categories or [1, 2, 3, 4, 5]
+    compress_categories = compress_categories or set()
     eval_logger.info(f"Evaluating categories: {allow_categories}")
-    eval_logger.info(f"Compressing retrieved context: {compress_context}")
+    eval_logger.info(f"Compressing retrieved context for categories: {sorted(compress_categories)}")
 
     for sample_idx, sample in enumerate(samples):
         # agent指的并不是真正意义上的agent，而是一个封装了内存系统和LLM控制器的类，
@@ -467,7 +468,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         # 并根据问题和上下文生成答案。
         # 每个样本都会创建一个新的agent实例，以确保记忆系统从头开始构建，避免不同样本之间的记忆干扰。
         agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                       sglang_host, sglang_port, compress_context)
+                                       sglang_host, sglang_port, compress_categories)
 
         memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
         retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
@@ -597,7 +598,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "model": model,
         "dataset": dataset_path,
         "memory_layer": "robust",
-        "compress_context": compress_context,
+        "compress_context": bool(compress_categories),
+        "compress_categories": sorted(compress_categories),
         "total_questions": total_questions,
         "category_distribution": {
             str(cat): count for cat, count in category_counts.items()
@@ -650,7 +652,9 @@ def main():
     parser.add_argument("--categories", type=str, default=None,
                         help="Comma-separated categories to evaluate, e.g. '3' or '1,3'")
     parser.add_argument("--compress_context", action="store_true",
-                        help="Use an extra LLM pass to compress retrieved memories into evidence before answering")
+                        help="Compress retrieved memories for all categories before answering")
+    parser.add_argument("--compress_categories", type=str, default=None,
+                        help="Comma-separated categories to compress, e.g. '1,2'. Overrides the default no-compression behavior")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
@@ -671,6 +675,19 @@ def main():
         if invalid_categories:
             raise ValueError(f"Invalid categories: {invalid_categories}")
 
+    compress_categories = set()
+    if args.compress_context:
+        compress_categories = {1, 2, 3, 4, 5}
+    if args.compress_categories:
+        compress_categories = {
+            int(category.strip())
+            for category in args.compress_categories.split(",")
+            if category.strip()
+        }
+        invalid_categories = [category for category in compress_categories if category not in [1, 2, 3, 4, 5]]
+        if invalid_categories:
+            raise ValueError(f"Invalid compression categories: {invalid_categories}")
+
     dataset_path = os.path.join(os.path.dirname(__file__), args.dataset)
     output_path = os.path.join(os.path.dirname(__file__), args.output) if args.output else None
 
@@ -678,7 +695,7 @@ def main():
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port, allow_categories,
-        args.compress_context,
+        compress_categories,
     )
 
 
