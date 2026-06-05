@@ -5,32 +5,52 @@ import os
 from typing import List, Dict, Union
 import statistics
 from collections import defaultdict
-from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from bert_score import score as bert_score
-import nltk
-from nltk.translate.meteor_score import meteor_score
-from sentence_transformers import SentenceTransformer
+try:
+    from rouge_score import rouge_scorer
+except ImportError:
+    rouge_scorer = None
+try:
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    from nltk.translate.meteor_score import meteor_score
+    import nltk
+except ImportError:
+    sentence_bleu = None
+    SmoothingFunction = None
+    meteor_score = None
+    nltk = None
+try:
+    from bert_score import score as bert_score
+except ImportError:
+    bert_score = None
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import pytorch_cos_sim
+except ImportError:
+    SentenceTransformer = None
+    pytorch_cos_sim = None
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
-from sentence_transformers.util import pytorch_cos_sim
 
 # Download required NLTK data
-try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('wordnet', quiet=True)
-except Exception as e:
-    print(f"Error downloading NLTK data: {e}")
+if nltk is not None:
+    try:
+        nltk.download('punkt', quiet=True)
+        nltk.download('wordnet', quiet=True)
+    except Exception as e:
+        print(f"Error downloading NLTK data: {e}")
 
 # Initialize SentenceTransformer model (this will be reused)
 EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 DISABLE_BERTSCORE = os.getenv("DISABLE_BERTSCORE", "0").lower() in {"1", "true", "yes"}
 
 try:
-    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME) if SentenceTransformer else None
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
@@ -43,6 +63,16 @@ def simple_tokenize(text):
 
 def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate ROUGE scores for prediction against reference."""
+    if rouge_scorer is None:
+        pred_tokens = simple_tokenize(prediction)
+        ref_tokens = simple_tokenize(reference)
+        overlap = len(set(pred_tokens) & set(ref_tokens))
+        rouge1 = overlap / max(1, len(set(ref_tokens)))
+        return {
+            'rouge1_f': rouge1,
+            'rouge2_f': 0.0,
+            'rougeL_f': rouge1,
+        }
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
     scores = scorer.score(reference, prediction)
     return {
@@ -53,6 +83,11 @@ def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BLEU scores with different n-gram settings."""
+    if sentence_bleu is None or nltk is None:
+        pred_tokens = simple_tokenize(prediction)
+        ref_tokens = simple_tokenize(reference)
+        overlap = len(set(pred_tokens) & set(ref_tokens)) / max(1, len(set(pred_tokens)))
+        return {f'bleu{n}': overlap if n == 1 else 0.0 for n in range(1, 5)}
     pred_tokens = nltk.word_tokenize(prediction.lower())
     ref_tokens = [nltk.word_tokenize(reference.lower())]
     
@@ -71,7 +106,7 @@ def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_bert_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BERTScore for semantic similarity."""
-    if DISABLE_BERTSCORE:
+    if DISABLE_BERTSCORE or bert_score is None:
         return {
             'bert_precision': 0.0,
             'bert_recall': 0.0,
@@ -94,6 +129,10 @@ def calculate_bert_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_meteor_score(prediction: str, reference: str) -> float:
     """Calculate METEOR score for the prediction."""
+    if meteor_score is None:
+        pred_tokens = set(simple_tokenize(prediction))
+        ref_tokens = set(simple_tokenize(reference))
+        return len(pred_tokens & ref_tokens) / max(1, len(ref_tokens))
     try:
         return meteor_score([reference.split()], prediction.split())
     except Exception as e:

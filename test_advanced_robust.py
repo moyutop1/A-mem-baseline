@@ -26,30 +26,41 @@ from typing import List, Dict, Optional, Set
 from pathlib import Path
 import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
-import nltk
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import pytorch_cos_sim
+try:
+    import nltk
+except ImportError:
+    nltk = None
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import pytorch_cos_sim
+except ImportError:
+    SentenceTransformer = None
+    pytorch_cos_sim = None
 import statistics
 from collections import defaultdict
 import pickle
 import random
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime, timedelta
 
 EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 
 # Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('wordnet')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('wordnet')
+if nltk is not None:
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('wordnet')
+    except LookupError:
+        nltk.download('punkt')
+        nltk.download('wordnet')
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    sentence_model = SentenceTransformer(EMBEDDING_MODEL_NAME) if SentenceTransformer else None
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
@@ -478,6 +489,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         retriever_cache_version_file = os.path.join(
             memories_dir, f"retriever_cache_version_sample_{sample_idx}.txt"
         )
+        domain_graph_cache_file = os.path.join(
+            memories_dir, f"domain_graph_cache_sample_{sample_idx}.json"
+        )
 
         if os.path.exists(memory_cache_file):
             eval_logger.info(f"Loading cached memories for sample {sample_idx}")
@@ -545,6 +559,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             with open(retriever_cache_version_file, 'w') as f:
                 f.write(RETRIEVAL_INDEX_VERSION)
             eval_logger.info(f"Successfully cached {len(memories_to_cache)} memories")
+
+        graph_cache_status = agent.memory_system.prepare_offline_domain_graph(
+            sample_id=str(getattr(sample, "sample_id", f"sample_{sample_idx}")),
+            cache_path=domain_graph_cache_file,
+            session_summaries=sample.session_summary,
+        )
+        eval_logger.info(f"Offline domain graph status for sample {sample_idx}: {graph_cache_status}")
+        with open(memory_cache_file, 'wb') as f:
+            pickle.dump(agent.memory_system.memories, f)
+        agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
+        with open(retriever_cache_version_file, 'w') as f:
+            f.write(RETRIEVAL_INDEX_VERSION)
 
         eval_logger.info(f"Processing sample {sample_idx + 1}/{len(samples)}")
 

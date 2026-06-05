@@ -10,7 +10,7 @@ Key differences from the original:
   - Graceful degradation: evolution failure -> memory stored without evolution
 """
 
-from typing import List, Dict, Optional, Literal, Any
+from typing import List, Dict, Optional, Literal, Any, Set
 import json
 import re
 import uuid
@@ -18,10 +18,92 @@ import os
 import time
 import logging
 import functools
+import math
 from datetime import datetime
 from abc import ABC, abstractmethod
 
-from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
+try:
+    from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
+except ImportError as import_error:
+    logger_import_error = import_error
+
+    def simple_tokenize(text):
+        return re.findall(r"\b\w+\b", str(text).lower())
+
+    class SimpleEmbeddingRetriever:
+        """Local fallback used when optional baseline dependencies are unavailable."""
+
+        def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+            class _HashingEmbeddingModel:
+                def __init__(self, dim: int = 384):
+                    self.dim = dim
+
+                def encode(self, documents):
+                    vectors = []
+                    for doc in documents:
+                        vector = [0.0] * self.dim
+                        for token in re.findall(r"\b\w+\b", str(doc).lower()):
+                            idx = hash(token) % self.dim
+                            vector[idx] += 1.0
+                        norm = sum(value * value for value in vector) ** 0.5
+                        if norm:
+                            vector = [value / norm for value in vector]
+                        vectors.append(vector)
+                    return vectors
+
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.model = SentenceTransformer(model_name)
+            except ImportError:
+                self.model = _HashingEmbeddingModel()
+            self.corpus = []
+            self.embeddings = None
+            self.document_ids = {}
+
+        def add_documents(self, documents: List[str]):
+            import numpy as _np
+            if not self.corpus:
+                self.corpus = list(documents)
+                self.embeddings = self.model.encode(documents)
+                self.document_ids = {doc: idx for idx, doc in enumerate(documents)}
+                return
+            start_idx = len(self.corpus)
+            self.corpus.extend(documents)
+            new_embeddings = self.model.encode(documents)
+            self.embeddings = new_embeddings if self.embeddings is None else _np.vstack([self.embeddings, new_embeddings])
+            for idx, doc in enumerate(documents):
+                self.document_ids[doc] = start_idx + idx
+
+        def search(self, query: str, k: int = 5):
+            import numpy as _np
+            if not self.corpus or self.embeddings is None:
+                return []
+            query_embedding = self.model.encode([query])[0]
+            left = _np.asarray(self.embeddings, dtype=float)
+            right = _np.asarray(query_embedding, dtype=float)
+            denom = (_np.linalg.norm(left, axis=1) * max(_np.linalg.norm(right), 1e-12))
+            similarities = left.dot(right) / _np.maximum(denom, 1e-12)
+            return _np.argsort(similarities)[-k:][::-1]
+
+        def save(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
+            import numpy as _np
+            import pickle as _pickle
+            if self.embeddings is not None:
+                _np.save(retriever_cache_embeddings_file, self.embeddings)
+            with open(retriever_cache_file, "wb") as f:
+                _pickle.dump({"corpus": self.corpus, "document_ids": self.document_ids}, f)
+
+        def load(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
+            import numpy as _np
+            import pickle as _pickle
+            if os.path.exists(retriever_cache_embeddings_file):
+                self.embeddings = _np.load(retriever_cache_embeddings_file)
+            if os.path.exists(retriever_cache_file):
+                with open(retriever_cache_file, "rb") as f:
+                    state = _pickle.load(f)
+                self.corpus = state.get("corpus", [])
+                self.document_ids = state.get("document_ids", {})
+            return self
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
     EVOLUTION_DECISION_PROMPT,
@@ -52,6 +134,11 @@ STABLE_RETRIEVAL_EDGES = {
     "elaborates",
     "co_used",
     "local_context",
+    "similar_event",
+    "same_character",
+    "temporal_anchor",
+    "supports",
+    "derived_from",
 }
 DISALLOWED_GRAPH_EDGES = {"updates", "replaces", "conflicts_with", "update", "replace", "conflict"}
 ACTIVE_RETRIEVAL_STATUSES = {"active", "candidate", "stale"}
@@ -59,7 +146,13 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v2_query_rerank_local_context"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v3_domain_graph"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v1_offline_llm_annotation"
+DEFAULT_DOMAIN_TOP_K = 3
+DEFAULT_DOMAIN_SEED_TOP_K = 20
+DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
+DEFAULT_FINAL_BUNDLE_SIZE = 6
+DEFAULT_FINAL_BUNDLE_MAX_SIZE = 8
 
 UNCERTAIN_MARKERS = {
     "maybe", "might", "possibly", "probably", "not sure", "uncertain",
@@ -185,13 +278,18 @@ class RobustSGLangController(RobustBaseLLMController):
     def __init__(self, model: str = "llama2",
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000):
-        import requests as _requests
+        try:
+            import requests as _requests
+        except ImportError:
+            _requests = None
         self._requests = _requests
         self.model = model
         self.base_url = f"{sglang_host}:{sglang_port}"
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        if self._requests is None:
+            raise ImportError("requests package not found. Install it to use the SGLang backend.")
         payload = {
             "text": prompt,
             "sampling_params": {
@@ -216,13 +314,18 @@ class RobustVLLMController(RobustBaseLLMController):
     def __init__(self, model: str = "llama2",
                  vllm_host: str = "http://localhost",
                  vllm_port: int = 30000):
-        import requests as _requests
+        try:
+            import requests as _requests
+        except ImportError:
+            _requests = None
         self._requests = _requests
         self.model = model
         self.base_url = f"{vllm_host}:{vllm_port}"
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        if self._requests is None:
+            raise ImportError("requests package not found. Install it to use the vLLM backend.")
         payload = {
             "model": self.model,
             "messages": [
@@ -331,7 +434,13 @@ class RobustMemoryNote:
                  conditions: Optional[List[Dict[str, Any]]] = None,
                  revision_history: Optional[List[Dict[str, Any]]] = None,
                  evidence_memory_ids: Optional[List[str]] = None,
+                 temporal_expressions: Optional[List[Dict[str, Any]]] = None,
                  confidence: Optional[float] = None,
+                 reliability_alpha: Optional[float] = None,
+                 reliability_beta: Optional[float] = None,
+                 citation_count: Optional[int] = None,
+                 successful_citation_count: Optional[int] = None,
+                 failed_citation_count: Optional[int] = None,
                  last_updated: Optional[str] = None,
                  llm_controller: Optional[RobustLLMController] = None):
 
@@ -373,7 +482,13 @@ class RobustMemoryNote:
         self.conditions = conditions or []
         self.revision_history = revision_history or []
         self.evidence_memory_ids = evidence_memory_ids or []
+        self.temporal_expressions = temporal_expressions or []
         self.confidence = float(confidence if confidence is not None else 1.0)
+        self.reliability_alpha = float(reliability_alpha if reliability_alpha is not None else 1.0)
+        self.reliability_beta = float(reliability_beta if reliability_beta is not None else 1.0)
+        self.citation_count = int(citation_count or 0)
+        self.successful_citation_count = int(successful_citation_count or 0)
+        self.failed_citation_count = int(failed_citation_count or 0)
 
     def _infer_domain_paths(self) -> List[str]:
         """Create lightweight domain paths from existing category/tags metadata."""
@@ -434,7 +549,11 @@ class RobustAgenticMemorySystem:
                  sglang_port: int = 30000,
                  check_connection: bool = False,
                  domain_candidate_top_k: int = DEFAULT_DOMAIN_CANDIDATE_TOP_K,
-                 domain_embedding_threshold: float = DEFAULT_DOMAIN_EMBEDDING_THRESHOLD):
+                 domain_embedding_threshold: float = DEFAULT_DOMAIN_EMBEDDING_THRESHOLD,
+                 domain_seed_top_k: int = DEFAULT_DOMAIN_SEED_TOP_K,
+                 global_fallback_top_k: int = DEFAULT_GLOBAL_FALLBACK_TOP_K,
+                 final_bundle_size: int = DEFAULT_FINAL_BUNDLE_SIZE,
+                 final_bundle_max_size: int = DEFAULT_FINAL_BUNDLE_MAX_SIZE):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         model_name = model_name or DEFAULT_EMBEDDING_MODEL
@@ -447,6 +566,11 @@ class RobustAgenticMemorySystem:
         self.evo_threshold = evo_threshold
         self.domain_candidate_top_k = max(1, int(domain_candidate_top_k))
         self.domain_embedding_threshold = float(domain_embedding_threshold)
+        self.domain_seed_top_k = max(1, int(domain_seed_top_k))
+        self.global_fallback_top_k = max(0, int(global_fallback_top_k))
+        self.final_bundle_size = max(1, int(final_bundle_size))
+        self.final_bundle_max_size = max(self.final_bundle_size, int(final_bundle_max_size))
+        self.offline_domain_tree: List[Dict[str, Any]] = []
         self.retrieval_index_version = RETRIEVAL_INDEX_VERSION
 
     @staticmethod
@@ -565,36 +689,672 @@ class RobustAgenticMemorySystem:
                     neighbors.append(neighbor)
         return neighbors
 
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        stripped = str(text or "").strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip()
+
+    @classmethod
+    def _parse_json_payload(cls, response: str) -> Dict[str, Any]:
+        cleaned = cls._strip_markdown_fences(response)
+        try:
+            data = json.loads(cleaned)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if not match:
+                return {}
+            try:
+                data = json.loads(match.group(0))
+                return data if isinstance(data, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+
+    @staticmethod
+    def _normalize_domain_path(path: Any) -> str:
+        parts = [
+            re.sub(r"\s+", " ", part.strip())
+            for part in str(path or "").replace(">", "/").split("/")
+            if part and part.strip()
+        ]
+        return " / ".join(parts[:3]) if parts else "General / Conversation / Episodic"
+
+    def _valid_domain_paths(self) -> List[str]:
+        if self.offline_domain_tree:
+            paths = [entry.get("path", "") for entry in self.offline_domain_tree]
+            return [path for path in paths if path]
+        return list(self._domain_catalog().keys())
+
+    def _memory_brief(self, memory: RobustMemoryNote, max_chars: int = 220) -> str:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        pieces = [
+            fields.get("dia_id", ""),
+            fields.get("session_date", ""),
+            fields.get("speaker", ""),
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+        ]
+        brief = " | ".join(piece for piece in pieces if piece)
+        return brief[:max_chars]
+
+    def _conversation_overview(
+        self,
+        session_summaries: Optional[Dict[str, str]] = None,
+        max_lines: int = 80,
+    ) -> str:
+        lines: List[str] = []
+        if session_summaries:
+            for key, value in sorted(session_summaries.items()):
+                if value:
+                    lines.append(f"{key}: {str(value)[:360]}")
+                if len(lines) >= max_lines:
+                    break
+        if len(lines) < max_lines:
+            memories = list(self.memories.values())
+            step = max(1, len(memories) // max(1, max_lines - len(lines)))
+            for memory in memories[::step]:
+                lines.append(self._memory_brief(self._ensure_memory_schema(memory), max_chars=260))
+                if len(lines) >= max_lines:
+                    break
+        return "\n".join(lines)
+
+    def _fallback_domain_tree(self) -> List[Dict[str, Any]]:
+        seed_paths = [
+            "Personal Life / Family / Relationships",
+            "Personal Life / Identity / Self Expression",
+            "Career Education / Work / Goals",
+            "Health Wellbeing / Mental Health / Support",
+            "Hobbies Interests / Arts Media / Entertainment",
+            "Events Activities / Travel Meetings / Experiences",
+            "Social Relationship / Friends / Conversation Partner",
+            "Places Objects / Images / Visual Evidence",
+            "Plans Decisions / Future Intentions / Commitments",
+            "General Conversation / Episodic Turns / Miscellaneous",
+        ]
+        return [
+            {
+                "path": path,
+                "description": f"LoCoMo memories related to {path.lower()}.",
+                "keywords": [part.lower() for part in path.replace("/", " ").split()[:6]],
+            }
+            for path in seed_paths
+        ]
+
+    def _normalize_domain_tree(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_domains = payload.get("domains") or payload.get("domain_tree") or payload.get("tree") or []
+        if isinstance(raw_domains, dict):
+            raw_domains = raw_domains.get("domains", [])
+        normalized: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in raw_domains:
+            if isinstance(item, str):
+                path = self._normalize_domain_path(item)
+                description = ""
+                keywords: List[str] = []
+            elif isinstance(item, dict):
+                path = self._normalize_domain_path(
+                    item.get("path") or item.get("domain_path") or item.get("name") or item.get("title")
+                )
+                description = str(item.get("description") or item.get("summary") or "")
+                raw_keywords = item.get("keywords") or item.get("tags") or []
+                if isinstance(raw_keywords, str):
+                    keywords = [token.strip() for token in re.split(r"[,;/]", raw_keywords) if token.strip()]
+                else:
+                    keywords = [str(token).strip() for token in raw_keywords if str(token).strip()]
+            else:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            normalized.append({
+                "path": path,
+                "description": description[:500],
+                "keywords": keywords[:12],
+            })
+            if len(normalized) >= 36:
+                break
+        return normalized or self._fallback_domain_tree()
+
+    def _generate_domain_tree_with_llm(
+        self,
+        sample_id: str,
+        session_summaries: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        overview = self._conversation_overview(session_summaries=session_summaries)
+        prompt = f"""Build a three-level domain tree for one LoCoMo long conversation sample.
+
+Sample id: {sample_id}
+
+Conversation overview:
+{overview}
+
+Return JSON only:
+{{
+  "domains": [
+    {{
+      "path": "Level 1 / Level 2 / Level 3",
+      "description": "What memories belong here.",
+      "keywords": ["keyword1", "keyword2"]
+    }}
+  ]
+}}
+
+Requirements:
+- Create 8 to 24 domain paths.
+- Every path must have exactly three levels separated by " / ".
+- Domains should be specific to this two-person conversation.
+- Prefer recurring topics, events, relationships, goals, places, objects, and temporal storylines.
+"""
+        try:
+            response = self.llm_controller.llm.get_completion(prompt, temperature=0.1)
+            return self._normalize_domain_tree(self._parse_json_payload(response))
+        except Exception as e:
+            logger.warning("Offline domain tree LLM failed for sample %s: %s; using fallback tree", sample_id, e)
+            return self._fallback_domain_tree()
+
+    def _domain_texts(self, domain_tree: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+        entries = domain_tree or self.offline_domain_tree or self._fallback_domain_tree()
+        texts: Dict[str, str] = {}
+        for entry in entries:
+            path = self._normalize_domain_path(entry.get("path", ""))
+            texts[path] = " ".join([
+                path,
+                str(entry.get("description", "")),
+                " ".join(str(keyword) for keyword in entry.get("keywords", []) or []),
+            ]).strip()
+        return texts
+
+    def _embedding_domain_annotation(
+        self,
+        memory: RobustMemoryNote,
+        domain_tree: Optional[List[Dict[str, Any]]] = None,
+        max_domains: int = 3,
+    ) -> List[str]:
+        domain_texts = self._domain_texts(domain_tree)
+        if not domain_texts:
+            return ["General / Conversation / Episodic"]
+        memory_text = self._memory_to_index_text(memory)
+        try:
+            query_embedding = self.retriever.model.encode([memory_text])[0]
+            domain_paths = list(domain_texts.keys())
+            embeddings = self.retriever.model.encode([domain_texts[path] for path in domain_paths])
+            scored = [
+                (self._cosine_similarity(query_embedding, embedding), path)
+                for path, embedding in zip(domain_paths, embeddings)
+            ]
+            scored.sort(reverse=True)
+            selected = [path for _, path in scored[:max_domains]]
+        except Exception as e:
+            logger.warning("Embedding domain annotation failed: %s; using lexical fallback", e)
+            mem_tokens = self._retrieval_tokens(memory_text)
+            scored = []
+            for path, text in domain_texts.items():
+                dom_tokens = self._retrieval_tokens(text)
+                scored.append((len(mem_tokens & dom_tokens), path))
+            scored.sort(reverse=True)
+            selected = [path for score, path in scored[:max_domains] if score > 0]
+        return selected[:max_domains] or [next(iter(domain_texts.keys()))]
+
+    def _annotate_domains_with_llm(
+        self,
+        domain_tree: List[Dict[str, Any]],
+        batch_size: int = 8,
+    ) -> Dict[str, List[str]]:
+        valid_paths = [entry["path"] for entry in domain_tree if entry.get("path")]
+        valid_set = set(valid_paths)
+        if not valid_paths:
+            return {}
+        domain_block = "\n".join(
+            f"- {entry['path']}: {entry.get('description', '')}"
+            for entry in domain_tree
+            if entry.get("path")
+        )
+        memories = [self._ensure_memory_schema(memory) for memory in self.memories.values()]
+        annotations: Dict[str, List[str]] = {}
+        for start in range(0, len(memories), batch_size):
+            batch = memories[start:start + batch_size]
+            memory_block = "\n".join(self._memory_brief(memory, max_chars=260) for memory in batch)
+            prompt = f"""Assign LoCoMo dialogue memories to domain paths.
+
+Valid domain paths:
+{domain_block}
+
+Memories:
+{memory_block}
+
+Return JSON only:
+{{
+  "annotations": [
+    {{"dia_id": "D1:1", "domain_paths": ["Level 1 / Level 2 / Level 3"]}}
+  ]
+}}
+
+Rules:
+- Use only valid domain paths from the list.
+- Assign 1 to 3 paths per memory.
+- Prefer the most specific directly relevant paths.
+"""
+            try:
+                response = self.llm_controller.llm.get_completion(prompt, temperature=0.1)
+                payload = self._parse_json_payload(response)
+                raw_items = payload.get("annotations") or payload.get("memories") or []
+            except Exception as e:
+                logger.warning("Domain annotation batch LLM failed at memory %d: %s", start, e)
+                raw_items = []
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                dia_id = str(item.get("dia_id", "")).strip()
+                raw_paths = item.get("domain_paths") or item.get("domains") or []
+                if isinstance(raw_paths, str):
+                    raw_paths = [raw_paths]
+                paths = []
+                for path in raw_paths:
+                    normalized = self._normalize_domain_path(path)
+                    if normalized in valid_set and normalized not in paths:
+                        paths.append(normalized)
+                    if len(paths) >= 3:
+                        break
+                if dia_id and paths:
+                    annotations[dia_id] = paths
+
+        for memory in memories:
+            dia_id = self._dia_id_for_memory(memory)
+            if dia_id and dia_id not in annotations:
+                annotations[dia_id] = self._embedding_domain_annotation(memory, domain_tree)
+        return annotations
+
+    def _detect_temporal_expressions(self, memory: RobustMemoryNote) -> List[Dict[str, Any]]:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        text = fields.get("content", getattr(memory, "current_content", memory.content))
+        session_date = fields.get("session_date", "")
+        temporal_markers = [
+            "yesterday", "today", "tomorrow", "last week", "next week", "last month",
+            "next month", "last year", "next year", "last monday", "last tuesday",
+            "last wednesday", "last thursday", "last friday", "last saturday", "last sunday",
+        ]
+        lowered = text.lower()
+        return [
+            {"text": marker, "anchor": session_date, "normalized_date": ""}
+            for marker in temporal_markers
+            if marker in lowered
+        ]
+
+    def _clear_offline_graph_edges(self) -> None:
+        offline_relations = {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"}
+        for memory in self.memories.values():
+            memory = self._ensure_memory_schema(memory)
+            memory.links = [
+                edge for edge in getattr(memory, "links", [])
+                if not (isinstance(edge, dict) and edge.get("relation") in offline_relations)
+            ]
+
+    def _event_text(self, memory: RobustMemoryNote) -> str:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        return " ".join([
+            fields.get("speaker", ""),
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+            fields.get("image_query", ""),
+            " ".join(getattr(memory, "domain_paths", [])),
+        ]).strip()
+
+    def _shared_domain(self, left: RobustMemoryNote, right: RobustMemoryNote) -> bool:
+        left_domains = set(getattr(left, "domain_paths", []) or [])
+        right_domains = set(getattr(right, "domain_paths", []) or [])
+        return bool(left_domains & right_domains)
+
+    def _speaker_for_memory(self, memory: RobustMemoryNote) -> str:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        return fields.get("speaker", "").strip()
+
+    def _build_offline_graph_edges(self) -> None:
+        memories = [self._ensure_memory_schema(memory) for memory in self.memories.values()]
+        if not memories:
+            return
+        self._clear_offline_graph_edges()
+        for memory in memories:
+            memory.temporal_expressions = self._detect_temporal_expressions(memory)
+
+        event_texts = [self._event_text(memory) for memory in memories]
+        try:
+            event_embeddings = self.retriever.model.encode(event_texts)
+        except Exception as e:
+            logger.warning("Event embedding failed during graph construction: %s", e)
+            event_embeddings = [None for _ in memories]
+
+        dia_keys = [self._dia_sort_key(self._dia_id_for_memory(memory) or "") for memory in memories]
+        speakers = [self._speaker_for_memory(memory) for memory in memories]
+        by_speaker: Dict[str, List[int]] = {}
+        for idx, speaker in enumerate(speakers):
+            if speaker:
+                by_speaker.setdefault(speaker, []).append(idx)
+        for speaker_indices in by_speaker.values():
+            speaker_indices.sort(key=lambda idx: dia_keys[idx] or (10**9, 10**9))
+            for left_idx, right_idx in zip(speaker_indices, speaker_indices[1:]):
+                left = memories[left_idx]
+                right = memories[right_idx]
+                self._add_edge(left, right, "same_character", "Adjacent memories from the same LoCoMo speaker.", 0.4)
+                self._add_edge(right, left, "same_character", "Adjacent memories from the same LoCoMo speaker.", 0.4)
+
+        similar_counts: Dict[str, int] = {}
+        max_similar_edges_per_memory = 4
+
+        for i, left in enumerate(memories):
+            left_tokens = self._retrieval_tokens(event_texts[i])
+            left_key = dia_keys[i]
+            for j in range(i + 1, len(memories)):
+                right = memories[j]
+                right_key = dia_keys[j]
+                same_character = bool(speakers[i] and speakers[i] == speakers[j])
+
+                if similar_counts.get(left.id, 0) >= max_similar_edges_per_memory:
+                    continue
+                if similar_counts.get(right.id, 0) >= max_similar_edges_per_memory:
+                    continue
+                if not self._shared_domain(left, right):
+                    continue
+                right_tokens = self._retrieval_tokens(event_texts[j])
+                overlap = len(left_tokens & right_tokens)
+                if event_embeddings[i] is not None and event_embeddings[j] is not None:
+                    similarity = self._cosine_similarity(event_embeddings[i], event_embeddings[j])
+                else:
+                    similarity = overlap / max(1, len(left_tokens | right_tokens))
+
+                same_session_nearby = (
+                    left_key is not None and right_key is not None
+                    and left_key[0] == right_key[0]
+                    and abs(left_key[1] - right_key[1]) <= 4
+                )
+                cross_session_event = (
+                    left_key is not None and right_key is not None
+                    and left_key[0] != right_key[0]
+                    and same_character
+                    and overlap >= 2
+                )
+                if same_session_nearby and (overlap >= 1 or similarity >= 0.55):
+                    weight = 1.0
+                elif cross_session_event and similarity >= 0.45:
+                    weight = 0.6
+                else:
+                    continue
+                self._add_edge(left, right, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
+                self._add_edge(right, left, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
+                similar_counts[left.id] = similar_counts.get(left.id, 0) + 1
+                similar_counts[right.id] = similar_counts.get(right.id, 0) + 1
+
+    def _domain_graph_cache_payload(self, sample_id: str) -> Dict[str, Any]:
+        annotations = {}
+        temporal = {}
+        edges = {}
+        for memory in self.memories.values():
+            memory = self._ensure_memory_schema(memory)
+            dia_id = self._dia_id_for_memory(memory) or memory.id
+            annotations[dia_id] = list(getattr(memory, "domain_paths", []) or [])
+            temporal[dia_id] = list(getattr(memory, "temporal_expressions", []) or [])
+            edges[dia_id] = [
+                edge for edge in getattr(memory, "links", [])
+                if isinstance(edge, dict)
+                and edge.get("relation") in {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"}
+            ]
+        return {
+            "version": DOMAIN_GRAPH_CACHE_VERSION,
+            "retrieval_index_version": RETRIEVAL_INDEX_VERSION,
+            "sample_id": sample_id,
+            "domain_tree": self.offline_domain_tree,
+            "annotations": annotations,
+            "temporal_expressions": temporal,
+            "edges": edges,
+        }
+
+    def _apply_domain_graph_cache(self, payload: Dict[str, Any]) -> bool:
+        if payload.get("version") != DOMAIN_GRAPH_CACHE_VERSION:
+            return False
+        self.offline_domain_tree = self._normalize_domain_tree({"domains": payload.get("domain_tree", [])})
+        annotations = payload.get("annotations", {}) or {}
+        temporal = payload.get("temporal_expressions", {}) or {}
+        edges = payload.get("edges", {}) or {}
+        id_by_dia = {}
+        for memory in self.memories.values():
+            memory = self._ensure_memory_schema(memory)
+            dia_id = self._dia_id_for_memory(memory) or memory.id
+            id_by_dia[dia_id] = memory
+        for dia_id, memory in id_by_dia.items():
+            paths = annotations.get(dia_id)
+            if paths:
+                memory.domain_paths = [self._normalize_domain_path(path) for path in paths][:3]
+            memory.temporal_expressions = temporal.get(dia_id, getattr(memory, "temporal_expressions", []))
+            memory.links = [
+                edge for edge in getattr(memory, "links", [])
+                if not (isinstance(edge, dict) and edge.get("relation") in {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"})
+            ]
+        for dia_id, edge_list in edges.items():
+            source = id_by_dia.get(dia_id)
+            if not source:
+                continue
+            for edge in edge_list:
+                if not isinstance(edge, dict):
+                    continue
+                target = id_by_dia.get(edge.get("target_dia_id")) or next(
+                    (memory for memory in id_by_dia.values() if memory.id == edge.get("target_id")),
+                    None,
+                )
+                relation = edge.get("relation", "similar_event")
+                if target and relation in STABLE_RETRIEVAL_EDGES:
+                    self._add_edge(
+                        source,
+                        target,
+                        relation,
+                        str(edge.get("reason", "Loaded from offline domain graph cache.")),
+                        float(edge.get("strength", 0.6)),
+                    )
+        self.consolidate_memories()
+        return True
+
+    def prepare_offline_domain_graph(
+        self,
+        sample_id: str,
+        cache_path: Optional[str] = None,
+        session_summaries: Optional[Dict[str, str]] = None,
+        force_rebuild: bool = False,
+    ) -> Dict[str, Any]:
+        """Build or load per-sample domain tree, memory annotations, and leaf graph edges."""
+        for memory in self.memories.values():
+            self._ensure_memory_schema(memory)
+
+        if cache_path and not force_rebuild and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if self._apply_domain_graph_cache(payload):
+                    logger.info("Loaded offline domain graph cache for sample %s from %s", sample_id, cache_path)
+                    return {"loaded_cache": True, "cache_path": cache_path}
+            except Exception as e:
+                logger.warning("Failed to load domain graph cache %s: %s; rebuilding", cache_path, e)
+
+        self.offline_domain_tree = self._generate_domain_tree_with_llm(
+            sample_id=sample_id,
+            session_summaries=session_summaries,
+        )
+        annotations = self._annotate_domains_with_llm(self.offline_domain_tree)
+        for memory in self.memories.values():
+            memory = self._ensure_memory_schema(memory)
+            dia_id = self._dia_id_for_memory(memory)
+            if dia_id and annotations.get(dia_id):
+                memory.domain_paths = annotations[dia_id][:3]
+            elif not getattr(memory, "domain_paths", None):
+                memory.domain_paths = self._embedding_domain_annotation(memory, self.offline_domain_tree)
+
+        self._build_offline_graph_edges()
+        self.consolidate_memories()
+
+        if cache_path:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self._domain_graph_cache_payload(sample_id), f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.warning("Failed to save domain graph cache %s: %s", cache_path, e)
+        return {
+            "loaded_cache": False,
+            "domain_count": len(self.offline_domain_tree),
+            "memory_count": len(self.memories),
+            "cache_path": cache_path,
+        }
+
+    def _embedding_rank_indices(
+        self,
+        query: str,
+        candidate_indices: List[int],
+        top_k: int,
+    ) -> List[tuple]:
+        if not candidate_indices:
+            return []
+        all_memories = list(self.memories.values())
+        if self.retriever.embeddings is None or len(self.retriever.corpus) != len(all_memories):
+            self.consolidate_memories()
+        try:
+            query_embedding = self.retriever.model.encode([query])[0]
+            scored = []
+            for idx in candidate_indices:
+                if idx >= len(all_memories) or self.retriever.embeddings is None:
+                    continue
+                score = self._cosine_similarity(query_embedding, self.retriever.embeddings[idx])
+                scored.append((score, idx))
+            scored.sort(reverse=True)
+            return scored[:top_k]
+        except Exception as e:
+            logger.warning("Domain embedding ranking failed: %s", e)
+            return []
+
+    def _bm25_rank_indices(
+        self,
+        query: str,
+        candidate_indices: List[int],
+        top_k: int,
+    ) -> List[tuple]:
+        if not candidate_indices:
+            return []
+        all_memories = list(self.memories.values())
+        query_tokens = list(self._retrieval_tokens(query))
+        if not query_tokens:
+            return []
+        docs = []
+        valid_indices = []
+        for idx in candidate_indices:
+            if idx >= len(all_memories):
+                continue
+            memory = self._ensure_memory_schema(all_memories[idx])
+            docs.append(list(self._retrieval_tokens(self._memory_to_index_text(memory))))
+            valid_indices.append(idx)
+        if not docs:
+            return []
+        avgdl = sum(len(doc) for doc in docs) / max(1, len(docs))
+        doc_freq: Dict[str, int] = {}
+        for doc in docs:
+            for token in set(doc):
+                doc_freq[token] = doc_freq.get(token, 0) + 1
+        k1 = 1.5
+        b = 0.75
+        scored = []
+        for idx, doc in zip(valid_indices, docs):
+            freq: Dict[str, int] = {}
+            for token in doc:
+                freq[token] = freq.get(token, 0) + 1
+            score = 0.0
+            dl = len(doc)
+            for token in query_tokens:
+                if token not in freq:
+                    continue
+                df = doc_freq.get(token, 0)
+                idf = math.log(1.0 + (len(docs) - df + 0.5) / (df + 0.5))
+                tf = freq[token]
+                score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * dl / max(avgdl, 1e-6)))
+            if score > 0.0:
+                scored.append((score, idx))
+        scored.sort(reverse=True)
+        return scored[:top_k]
+
     def _retrieval_candidates(
         self,
         query: str,
         k: int,
         routed_domains: Optional[List[str]],
     ) -> List[tuple]:
-        search_k = min(max(k * 10, 40), max(k, len(self.memories)))
-        indices = self.retriever.search(query, search_k)
         all_memories = list(self.memories.values())
-        ranked = []
-        for order, i in enumerate(indices):
-            if i >= len(all_memories):
-                continue
-            memory = self._ensure_memory_schema(all_memories[i])
+        if not all_memories:
+            return []
+
+        candidate_indices = []
+        fallback_indices = []
+        for idx, memory in enumerate(all_memories):
+            memory = self._ensure_memory_schema(memory)
             if not self._is_retrievable(memory, query):
                 continue
-            if not self._domain_overlap(memory, routed_domains):
+            if self._domain_overlap(memory, routed_domains):
+                candidate_indices.append(idx)
+            fallback_indices.append(idx)
+
+        if not candidate_indices:
+            candidate_indices = fallback_indices
+
+        domain_top_k = max(self.domain_seed_top_k, k * 4)
+        embedding_ranked = self._embedding_rank_indices(query, candidate_indices, domain_top_k)
+        bm25_ranked = self._bm25_rank_indices(query, candidate_indices, domain_top_k)
+
+        seed_indices: Set[int] = set(idx for _, idx in embedding_ranked)
+        seed_indices.update(idx for _, idx in bm25_ranked)
+
+        lexical_ranked = []
+        for idx in candidate_indices:
+            lexical = self._lexical_relevance(self._ensure_memory_schema(all_memories[idx]), query)
+            if lexical > 0.0:
+                lexical_ranked.append((lexical, idx))
+        lexical_ranked.sort(reverse=True)
+        seed_indices.update(idx for _, idx in lexical_ranked[:domain_top_k])
+
+        if self.global_fallback_top_k:
+            global_embedding = self._embedding_rank_indices(query, fallback_indices, self.global_fallback_top_k)
+            global_bm25 = self._bm25_rank_indices(query, fallback_indices, self.global_fallback_top_k)
+            global_scored: Dict[int, float] = {}
+            for rank, (score, idx) in enumerate(global_embedding):
+                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + score)
+            for rank, (score, idx) in enumerate(global_bm25):
+                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + min(score, 5.0) / 5.0)
+            for idx, _ in sorted(global_scored.items(), key=lambda item: item[1], reverse=True)[:self.global_fallback_top_k]:
+                seed_indices.add(idx)
+
+        embedding_scores = {idx: score for score, idx in embedding_ranked}
+        bm25_scores = {idx: score for score, idx in bm25_ranked}
+        if bm25_scores:
+            max_bm25 = max(bm25_scores.values()) or 1.0
+        else:
+            max_bm25 = 1.0
+
+        ranked = []
+        query_domains = routed_domains or []
+        for order, idx in enumerate(seed_indices):
+            if idx >= len(all_memories):
+                continue
+            memory = self._ensure_memory_schema(all_memories[idx])
+            if not self._is_retrievable(memory, query):
                 continue
             lexical_score = self._lexical_relevance(memory, query)
-            ranked.append((self.lifecycle_penalty(memory), -lexical_score, order, i, memory))
-
-        if not ranked and routed_domains:
-            for order, i in enumerate(indices):
-                if i >= len(all_memories):
-                    continue
-                memory = self._ensure_memory_schema(all_memories[i])
-                if not self._is_retrievable(memory, query):
-                    continue
-                lexical_score = self._lexical_relevance(memory, query)
-                ranked.append((self.lifecycle_penalty(memory) + 0.1, -lexical_score, order, i, memory))
+            embedding_score = max(0.0, embedding_scores.get(idx, 0.0))
+            bm25_score = bm25_scores.get(idx, 0.0) / max_bm25
+            domain_score = 1.0 if self._domain_overlap(memory, query_domains) else 0.0
+            reliability = self.memory_reliability(memory)
+            citation_score = math.log1p(float(getattr(memory, "citation_count", 0))) / 5.0
+            combined_score = (
+                0.35 * embedding_score
+                + 0.25 * min(1.0, lexical_score / 8.0)
+                + 0.20 * min(1.0, bm25_score)
+                + 0.10 * domain_score
+                + 0.07 * reliability
+                + 0.03 * min(1.0, citation_score)
+            )
+            ranked.append((self.lifecycle_penalty(memory), -combined_score, order, idx, memory))
 
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
         return ranked
@@ -783,6 +1543,14 @@ class RobustAgenticMemorySystem:
             return 0.8
         return 0.0
 
+    def memory_reliability(self, memory: RobustMemoryNote) -> float:
+        """Bayesian-style utility estimate from historical citation feedback."""
+        success = float(getattr(memory, "successful_citation_count", 0))
+        failure = float(getattr(memory, "failed_citation_count", 0))
+        alpha = float(getattr(memory, "reliability_alpha", 1.0))
+        beta = float(getattr(memory, "reliability_beta", 1.0))
+        return (success + alpha) / max(success + failure + alpha + beta, 1e-6)
+
     def _ensure_memory_schema(self, memory: RobustMemoryNote) -> RobustMemoryNote:
         """Backfill lifecycle fields for old pickled caches or legacy notes."""
         if not hasattr(memory, "current_content"):
@@ -801,8 +1569,20 @@ class RobustAgenticMemorySystem:
             memory.revision_history = []
         if not hasattr(memory, "evidence_memory_ids"):
             memory.evidence_memory_ids = []
+        if not hasattr(memory, "temporal_expressions"):
+            memory.temporal_expressions = []
         if not hasattr(memory, "confidence"):
             memory.confidence = 1.0
+        if not hasattr(memory, "reliability_alpha"):
+            memory.reliability_alpha = 1.0
+        if not hasattr(memory, "reliability_beta"):
+            memory.reliability_beta = 1.0
+        if not hasattr(memory, "citation_count"):
+            memory.citation_count = 0
+        if not hasattr(memory, "successful_citation_count"):
+            memory.successful_citation_count = 0
+        if not hasattr(memory, "failed_citation_count"):
+            memory.failed_citation_count = 0
         if not hasattr(memory, "last_updated"):
             memory.last_updated = getattr(memory, "last_accessed", getattr(memory, "timestamp", ""))
         return memory
@@ -853,13 +1633,19 @@ class RobustAgenticMemorySystem:
 
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
         """Add a new memory note using write-time lifecycle consolidation."""
+        provided_domain_paths = kwargs.get("domain_paths")
         note = RobustMemoryNote(
             content=content,
             llm_controller=self.llm_controller,
             timestamp=time,
             **kwargs,
         )
-        note.domain_paths = self.route_domains(note.current_content, note=note)
+        if not provided_domain_paths:
+            note.domain_paths = self.route_domains(note.current_content, note=note)
+        if getattr(note, "memory_level", DEFAULT_MEMORY_LEVEL) == "instance" and provided_domain_paths:
+            self.memories[note.id] = note
+            self.retriever.add_documents([self._memory_to_index_text(note)])
+            return note.id
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
         if getattr(note, "_requires_reindex", False):
@@ -937,17 +1723,29 @@ class RobustAgenticMemorySystem:
         seen_ids = set()
         ranked = self._retrieval_candidates(query, k, routed_domains)
         primary_count = 0
-        max_context_blocks = max(k, k + 6)
+        primary_limit = min(k, self.final_bundle_size)
+        max_context_blocks = max(primary_limit, self.final_bundle_max_size)
         local_context_primary_limit = 3
         local_context_min_lexical_score = 1.0
-        for _, negative_lexical_score, _, i, memory in ranked:
+        relation_priority = {
+            "similar_event": 0,
+            "temporal_anchor": 1,
+            "supports": 2,
+            "derived_from": 3,
+            "same_character": 4,
+            "local_context": 5,
+            "same_entity": 6,
+            "same_topic": 7,
+            "semantic_related": 8,
+        }
+        for _, _, _, i, memory in ranked:
             if memory.id in seen_ids:
                 continue
             seen_ids.add(memory.id)
             memory_str += self._format_memory_for_context(memory)
             primary_count += 1
 
-            lexical_score = -negative_lexical_score
+            lexical_score = self._lexical_relevance(memory, query)
             if primary_count <= local_context_primary_limit and lexical_score >= local_context_min_lexical_score:
                 for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
                     if (
@@ -960,7 +1758,15 @@ class RobustAgenticMemorySystem:
                     memory_str += self._format_memory_for_context(target_memory, relation="local_context")
 
             neighbor_count = 0
-            for edge in getattr(memory, "links", []):
+            same_character_count = 0
+            sorted_edges = sorted(
+                getattr(memory, "links", []),
+                key=lambda edge: (
+                    relation_priority.get(self._edge_relation(edge), 99),
+                    -float(edge.get("strength", 0.0)) if isinstance(edge, dict) else 0.0,
+                ),
+            )
+            for edge in sorted_edges:
                 target_memory = self._edge_to_memory(edge, all_memories, id_to_memory)
                 relation = self._edge_relation(edge)
                 if (
@@ -971,12 +1777,16 @@ class RobustAgenticMemorySystem:
                     or target_memory.id in seen_ids
                 ):
                     continue
+                if relation == "same_character":
+                    if same_character_count >= 2:
+                        continue
+                    same_character_count += 1
                 seen_ids.add(target_memory.id)
                 memory_str += self._format_memory_for_context(target_memory, relation=relation)
                 neighbor_count += 1
-                if neighbor_count >= k or len(seen_ids) >= max_context_blocks:
+                if neighbor_count >= 2 or len(seen_ids) >= max_context_blocks:
                     break
-            if primary_count >= k or len(seen_ids) >= max_context_blocks:
+            if primary_count >= primary_limit or len(seen_ids) >= max_context_blocks:
                 break
         return memory_str
 
@@ -1410,6 +2220,7 @@ class RobustAgenticMemorySystem:
                 return
         source.links.append({
             "target_id": target.id,
+            "target_dia_id": self._dia_id_for_memory(target),
             "relation": relation,
             "strength": float(strength),
             "reason": reason,
