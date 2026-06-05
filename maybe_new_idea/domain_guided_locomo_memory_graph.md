@@ -630,3 +630,133 @@ Still unresolved:
 4. Exact LLM prompt/schema for domain tree construction and memory-domain annotation.
 5. Exact thresholds for cross-session similar_event construction.
 ```
+
+---
+
+## 12. First Ratio-0.1 DeepSeek Diagnosis
+
+Result file:
+
+```text
+robust_domain_graph_locomo10_cat124_ratio01_deepseek.json
+```
+
+Setup:
+
+```text
+model: deepseek-chat
+categories: 1, 2, 4
+ratio: 0.1
+questions: 139
+compress_context: false
+```
+
+Observed QA performance:
+
+```text
+overall exact_match: 0.173
+overall F1: 0.375
+
+category 1 exact_match: 0.000
+category 1 F1: 0.159
+
+category 2 exact_match: 0.405
+category 2 F1: 0.565
+
+category 4 exact_match: 0.129
+category 4 F1: 0.373
+```
+
+Evidence recall after normalizing gold evidence IDs:
+
+```text
+category 1 Evidence Recall@bundle: 15 / 32 = 0.469
+category 2 Evidence Recall@bundle: 25 / 37 = 0.676
+category 4 Evidence Recall@bundle: 36 / 70 = 0.514
+overall Evidence Recall@bundle: 76 / 139 = 0.547
+```
+
+Main diagnosis:
+
+```text
+1. Category 1 multi-hop performance is bottlenecked by incomplete evidence recall.
+   Many questions need multiple memories, but the current bundle often retrieves only
+   one supporting memory or misses all gold turns.
+
+2. Category 4 single-hop also misses too many exact evidence turns, so seed retrieval
+   and domain routing still need stronger lexical/entity fallback.
+
+3. Category 2 is the strongest category, but temporal answers still fail when the
+   right memory is present but the model or normalization chooses the wrong date phrase.
+
+4. Graph expansion is active, but local_context appears in almost every query and can
+   dominate the final bundle when the primary seed is wrong.
+
+5. similar_event helps, but current rule/embedding edges are still not enough for
+   multi-session multi-hop aggregation.
+```
+
+Observed context pattern:
+
+```text
+average retrieved dia_ids per question: about 8.86
+average raw_context length: about 5972 characters
+local_context relation count: 684
+similar_event relation count: 260
+same_character relation count: 8
+```
+
+Implication:
+
+```text
+The current first version retrieves a fairly large bundle, but not always the right
+bundle. The next iteration should improve seed precision and multi-evidence coverage
+before adding heavier memory rewriting or summary memories.
+```
+
+Recommended next changes:
+
+```text
+1. Add evidence-aware global lexical/entity fallback larger than the current top-5,
+   especially for exact action/object questions.
+
+2. Reduce automatic local_context expansion. Only add adjacent turns when the neighbor
+   has lexical/entity overlap with the query or the primary memory has high confidence.
+
+3. Make category 1 retrieval multi-hop aware: gather candidates from multiple domains
+   and enforce diversity across sessions/entities before reranking.
+
+4. Add query-type aware retrieval policies:
+   - category 1: prefer multi-seed, cross-session similar_event, entity/action coverage
+   - category 2: prefer temporal_anchor and date-bearing memories
+   - category 4: prefer exact BM25/entity match over broad embedding match
+
+5. Add an optional compression/rerank step for category 1/4 after retrieval, because
+   many hit-but-wrong examples contain the gold evidence but the answer selects only
+   a partial or noisy fact.
+```
+
+Implemented next patch:
+
+```text
+Version: robust_retrieval_v4_stronger_fallback
+
+1. Increase global fallback while keeping domain retrieval as the main path:
+   - global embedding fallback: top 5
+   - global BM25 fallback: top 15
+   - global entity/action fallback: top 10
+
+2. Add exact entity/action fallback scoring:
+   - speaker/person overlap
+   - query token overlap
+   - exact action words such as research, apply, paint, read, camp, support,
+     birthday, identity, beach, conference, meeting
+
+3. Reduce local_context expansion:
+   - radius 2 -> radius 1
+   - only first two primary seeds may add local context
+   - each primary seed may add at most one local neighbor
+   - neighbor must have lexical overlap with the query
+
+4. Bump retrieval and domain-graph cache versions so old caches are rebuilt.
+```

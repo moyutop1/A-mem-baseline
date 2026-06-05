@@ -146,11 +146,13 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v3_domain_graph"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v1_offline_llm_annotation"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v4_stronger_fallback"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v2_stronger_fallback"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
+DEFAULT_GLOBAL_BM25_TOP_K = 15
+DEFAULT_GLOBAL_ENTITY_TOP_K = 10
 DEFAULT_FINAL_BUNDLE_SIZE = 6
 DEFAULT_FINAL_BUNDLE_MAX_SIZE = 8
 
@@ -552,6 +554,8 @@ class RobustAgenticMemorySystem:
                  domain_embedding_threshold: float = DEFAULT_DOMAIN_EMBEDDING_THRESHOLD,
                  domain_seed_top_k: int = DEFAULT_DOMAIN_SEED_TOP_K,
                  global_fallback_top_k: int = DEFAULT_GLOBAL_FALLBACK_TOP_K,
+                 global_bm25_top_k: int = DEFAULT_GLOBAL_BM25_TOP_K,
+                 global_entity_top_k: int = DEFAULT_GLOBAL_ENTITY_TOP_K,
                  final_bundle_size: int = DEFAULT_FINAL_BUNDLE_SIZE,
                  final_bundle_max_size: int = DEFAULT_FINAL_BUNDLE_MAX_SIZE):
 
@@ -568,6 +572,8 @@ class RobustAgenticMemorySystem:
         self.domain_embedding_threshold = float(domain_embedding_threshold)
         self.domain_seed_top_k = max(1, int(domain_seed_top_k))
         self.global_fallback_top_k = max(0, int(global_fallback_top_k))
+        self.global_bm25_top_k = max(self.global_fallback_top_k, int(global_bm25_top_k))
+        self.global_entity_top_k = max(0, int(global_entity_top_k))
         self.final_bundle_size = max(1, int(final_bundle_size))
         self.final_bundle_max_size = max(self.final_bundle_size, int(final_bundle_max_size))
         self.offline_domain_tree: List[Dict[str, Any]] = []
@@ -1276,6 +1282,58 @@ Rules:
         scored.sort(reverse=True)
         return scored[:top_k]
 
+    def _entity_rank_indices(
+        self,
+        query: str,
+        candidate_indices: List[int],
+        top_k: int,
+    ) -> List[tuple]:
+        """Rank candidates by exact speaker/entity/action overlap for evidence fallback."""
+        if not candidate_indices:
+            return []
+        all_memories = list(self.memories.values())
+        query_tokens = self._retrieval_tokens(query)
+        if not query_tokens:
+            return []
+        query_lower = str(query).lower()
+        query_names = set(re.findall(r"\b[A-Z][a-z]+(?:'[a-z]+)?\b", str(query)))
+        scored = []
+        for idx in candidate_indices:
+            if idx >= len(all_memories):
+                continue
+            memory = self._ensure_memory_schema(all_memories[idx])
+            fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+            speaker = fields.get("speaker", "")
+            content = fields.get("content", getattr(memory, "current_content", memory.content))
+            exact_text = " ".join([
+                speaker,
+                content,
+                fields.get("image_caption", ""),
+                fields.get("image_query", ""),
+                " ".join(getattr(memory, "keywords", [])),
+                " ".join(getattr(memory, "tags", [])),
+            ])
+            exact_lower = exact_text.lower()
+            memory_tokens = self._retrieval_tokens(exact_text)
+            overlap = len(query_tokens & memory_tokens)
+            phrase_bonus = 0.0
+            for token in query_tokens:
+                if token in exact_lower:
+                    phrase_bonus += 0.25
+            name_bonus = 0.0
+            for name in query_names:
+                if name.lower() == speaker.lower() or name.lower() in exact_lower:
+                    name_bonus += 1.0
+            action_bonus = 0.0
+            for action in ("research", "apply", "paint", "read", "camp", "support", "birthday", "identity", "beach", "conference", "meeting"):
+                if action in query_lower and action in exact_lower:
+                    action_bonus += 1.5
+            score = 2.0 * overlap + phrase_bonus + name_bonus + action_bonus
+            if score > 0.0:
+                scored.append((score, idx))
+        scored.sort(reverse=True)
+        return scored[:top_k]
+
     def _retrieval_candidates(
         self,
         query: str,
@@ -1316,13 +1374,20 @@ Rules:
 
         if self.global_fallback_top_k:
             global_embedding = self._embedding_rank_indices(query, fallback_indices, self.global_fallback_top_k)
-            global_bm25 = self._bm25_rank_indices(query, fallback_indices, self.global_fallback_top_k)
+            global_bm25 = self._bm25_rank_indices(query, fallback_indices, self.global_bm25_top_k)
+            global_entity = self._entity_rank_indices(query, fallback_indices, self.global_entity_top_k)
             global_scored: Dict[int, float] = {}
             for rank, (score, idx) in enumerate(global_embedding):
                 global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + score)
             for rank, (score, idx) in enumerate(global_bm25):
                 global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + min(score, 5.0) / 5.0)
-            for idx, _ in sorted(global_scored.items(), key=lambda item: item[1], reverse=True)[:self.global_fallback_top_k]:
+            for rank, (score, idx) in enumerate(global_entity):
+                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + min(score, 10.0) / 10.0)
+            for idx, _ in sorted(
+                global_scored.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:max(self.global_bm25_top_k, self.global_entity_top_k, self.global_fallback_top_k)]:
                 seed_indices.add(idx)
 
         embedding_scores = {idx: score for score, idx in embedding_ranked}
@@ -1725,8 +1790,9 @@ Rules:
         primary_count = 0
         primary_limit = min(k, self.final_bundle_size)
         max_context_blocks = max(primary_limit, self.final_bundle_max_size)
-        local_context_primary_limit = 3
-        local_context_min_lexical_score = 1.0
+        local_context_primary_limit = 2
+        local_context_min_lexical_score = 2.0
+        local_context_neighbor_min_lexical_score = 1.0
         relation_priority = {
             "similar_event": 0,
             "temporal_anchor": 1,
@@ -1747,15 +1813,20 @@ Rules:
 
             lexical_score = self._lexical_relevance(memory, query)
             if primary_count <= local_context_primary_limit and lexical_score >= local_context_min_lexical_score:
-                for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
+                local_added = 0
+                for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=1):
                     if (
                         not self._is_retrievable(target_memory, query)
                         or target_memory.id in seen_ids
                         or len(seen_ids) >= max_context_blocks
+                        or self._lexical_relevance(target_memory, query) < local_context_neighbor_min_lexical_score
                     ):
                         continue
                     seen_ids.add(target_memory.id)
                     memory_str += self._format_memory_for_context(target_memory, relation="local_context")
+                    local_added += 1
+                    if local_added >= 1:
+                        break
 
             neighbor_count = 0
             same_character_count = 0
