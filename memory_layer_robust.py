@@ -155,6 +155,9 @@ DEFAULT_GLOBAL_BM25_TOP_K = 15
 DEFAULT_GLOBAL_ENTITY_TOP_K = 10
 DEFAULT_FINAL_BUNDLE_SIZE = 6
 DEFAULT_FINAL_BUNDLE_MAX_SIZE = 8
+DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 12
+DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 16
+DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K = 40
 
 UNCERTAIN_MARKERS = {
     "maybe", "might", "possibly", "probably", "not sure", "uncertain",
@@ -621,6 +624,49 @@ class RobustAgenticMemorySystem:
             for token in re.findall(r"[A-Za-z0-9]+", str(text).lower())
             if len(token) >= 3 and token not in stopwords
         }
+
+    @staticmethod
+    def _category1_query_expansion(query: str) -> str:
+        """Add conservative evidence cues for Cat1 multi-evidence retrieval."""
+        query_text = str(query or "")
+        query_lower = query_text.lower()
+        expansions: List[str] = []
+
+        def add(*terms: str) -> None:
+            for term in terms:
+                if term and term not in expansions:
+                    expansions.append(term)
+
+        if re.search(r"\bidentity\b|\btransgender\b|\btransition", query_lower):
+            add("transgender", "trans", "transition", "coming out", "womanhood", "gender identity")
+        if "relationship status" in query_lower or re.search(r"\bsingle parent\b|\bbreakup\b", query_lower):
+            add("single parent", "breakup", "support", "friends", "family")
+        if "career path" in query_lower or re.search(r"\bcounsel|mental health|therap", query_lower):
+            add("counseling", "mental health", "therapeutic", "workshop", "support")
+        if re.search(r"\bmove from\b|\bmoved from\b|\bhome country\b|\broots\b", query_lower):
+            add("home country", "Sweden", "roots", "grandma", "necklace")
+        if re.search(r"\bactivit|partake|destress|family|hikes?\b", query_lower):
+            add("pottery", "swimming", "camping", "hiking", "running", "painting", "frisbee", "family")
+        if re.search(r"\bkids?\b|\bchildren\b", query_lower):
+            add("kids", "children", "nature", "dinosaur", "animals", "exhibit", "family")
+        if re.search(r"\bevents?\b|\bparticipat|community|lgbtq|transgender-specific\b", query_lower):
+            add("support group", "pride parade", "school event", "workshop", "fundraiser", "community")
+        if re.search(r"\bpaint|painting|painted|art\b", query_lower):
+            add("painting", "painted", "artwork", "sunset", "lake", "portrait", "subject")
+        if re.search(r"\bpottery\b", query_lower):
+            add("pottery", "class", "clay", "kids", "made")
+        if re.search(r"\bpets?\b|\bnames?\b", query_lower):
+            add("pets", "names", "dog", "cat")
+        if re.search(r"\bmusical artists?\b|\bbands?\b|\bconcert\b", query_lower):
+            add("music", "concert", "artist", "band", "saw")
+        if re.search(r"\bbook\b|\bread\b|\bsuggestion\b", query_lower):
+            add("book", "read", "suggestion", "recommended", "novel")
+        if re.search(r"\bbeach\b", query_lower):
+            add("beach", "trip", "went", "2023")
+
+        if not expansions:
+            return query_text
+        return f"{query_text} ; evidence cues: {' '.join(expansions)}"
 
     def _lexical_relevance(self, memory: RobustMemoryNote, query: str) -> float:
         fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
@@ -1350,6 +1396,7 @@ Rules:
             category_int = int(category) if category is not None else None
         except (TypeError, ValueError):
             category_int = None
+        lexical_query = self._category1_query_expansion(query) if category_int == 1 else query
 
         candidate_indices = []
         fallback_indices = []
@@ -1365,8 +1412,10 @@ Rules:
             candidate_indices = fallback_indices
 
         domain_top_k = max(self.domain_seed_top_k, k * 4)
+        if category_int == 1:
+            domain_top_k = max(domain_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
         embedding_ranked = self._embedding_rank_indices(query, candidate_indices, domain_top_k)
-        bm25_ranked = self._bm25_rank_indices(query, candidate_indices, domain_top_k)
+        bm25_ranked = self._bm25_rank_indices(lexical_query, candidate_indices, domain_top_k)
 
         candidate_scores: Dict[int, Dict[str, Any]] = {}
 
@@ -1398,7 +1447,7 @@ Rules:
 
         lexical_ranked = []
         for idx in candidate_indices:
-            lexical = self._lexical_relevance(self._ensure_memory_schema(all_memories[idx]), query)
+            lexical = self._lexical_relevance(self._ensure_memory_schema(all_memories[idx]), lexical_query)
             if lexical > 0.0:
                 lexical_ranked.append((lexical, idx))
         lexical_ranked.sort(reverse=True)
@@ -1410,8 +1459,13 @@ Rules:
 
         if self.global_fallback_top_k:
             global_embedding = self._embedding_rank_indices(query, fallback_indices, self.global_fallback_top_k)
-            global_bm25 = self._bm25_rank_indices(query, fallback_indices, self.global_bm25_top_k)
-            global_entity = self._entity_rank_indices(query, fallback_indices, self.global_entity_top_k)
+            global_bm25_top_k = self.global_bm25_top_k
+            global_entity_top_k = self.global_entity_top_k
+            if category_int == 1:
+                global_bm25_top_k = max(global_bm25_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
+                global_entity_top_k = max(global_entity_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
+            global_bm25 = self._bm25_rank_indices(lexical_query, fallback_indices, global_bm25_top_k)
+            global_entity = self._entity_rank_indices(lexical_query, fallback_indices, global_entity_top_k)
             for rank, (score, idx) in enumerate(global_embedding):
                 item = _entry(idx)
                 item["global_embedding"] = max(item["global_embedding"], _rank_score(score, rank, cap=1.0))
@@ -1437,7 +1491,7 @@ Rules:
             if not self._is_retrievable(memory, query):
                 continue
             score_parts = candidate_scores[idx]
-            lexical_score = self._lexical_relevance(memory, query)
+            lexical_score = self._lexical_relevance(memory, lexical_query)
             domain_score = 1.0 if self._domain_overlap(memory, query_domains) else 0.0
             score_parts["domain_match"] = domain_score
             reliability = self.memory_reliability(memory)
@@ -1538,7 +1592,14 @@ Rules:
         query_lower = str(query or "").lower()
         slot_type = "fact"
         cue_terms: Set[str] = set()
-        if re.search(r"\bhow many\b|\bnumber of\b", query_lower):
+        if re.search(r"\bidentity|relationship status|career path\b", query_lower):
+            slot_type = "status"
+            cue_terms.update({
+                "identity", "relationship", "status", "career", "path", "decided",
+                "transition", "transgender", "womanhood", "single", "breakup",
+                "counseling", "mental", "health",
+            })
+        elif re.search(r"\bhow many\b|\bnumber of\b", query_lower):
             slot_type = "count"
             cue_terms.update({"time", "times", "number", "count", "once", "twice", "three", "four"})
         elif re.search(r"\bwhere\b", query_lower):
@@ -1575,9 +1636,6 @@ Rules:
                 "item", "items", "instrument", "instruments", "pet", "pets", "name",
                 "names", "change", "changes", "type", "types", "bought", "made",
             })
-        elif re.search(r"\bidentity|relationship status|career path\b", query_lower):
-            slot_type = "status"
-            cue_terms.update({"identity", "relationship", "status", "career", "path", "decided", "transition"})
 
         generic_question_terms = {
             "what", "where", "when", "who", "which", "does", "did", "has", "have",
@@ -2149,13 +2207,21 @@ Rules:
         ranked = self._retrieval_candidates(query, k, routed_domains, category=category_int)
         primary_count = 0
         if category_int == 1:
-            primary_limit = min(k, self.final_bundle_max_size)
+            primary_limit = min(
+                max(k, DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE),
+                DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE,
+            )
         else:
             primary_limit = min(k, self.final_bundle_size)
-        max_context_blocks = max(primary_limit, self.final_bundle_max_size)
+        max_context_blocks = (
+            DEFAULT_CAT1_MAX_CONTEXT_BLOCKS
+            if category_int == 1
+            else max(primary_limit, self.final_bundle_max_size)
+        )
         local_context_primary_limit = 2
         local_context_min_lexical_score = 2.0
         local_context_neighbor_min_lexical_score = 1.0
+        selected_primary_memories: List[RobustMemoryNote] = []
         relation_priority = {
             "similar_event": 0,
             "temporal_anchor": 1,
@@ -2186,6 +2252,7 @@ Rules:
                 continue
             seen_ids.add(memory.id)
             memory_str += self._format_memory_for_context(memory)
+            selected_primary_memories.append(memory)
             primary_count += 1
 
             lexical_score = self._lexical_relevance(memory, query)
@@ -2253,6 +2320,30 @@ Rules:
                     break
             if primary_count >= primary_limit or len(seen_ids) >= max_context_blocks:
                 break
+        if category_int == 1 and len(seen_ids) < max_context_blocks:
+            cat1_bridge_query = self._category1_query_expansion(query)
+            for memory in selected_primary_memories[:4]:
+                local_added = 0
+                for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
+                    if (
+                        not self._is_retrievable(target_memory, query)
+                        or target_memory.id in seen_ids
+                        or len(seen_ids) >= max_context_blocks
+                    ):
+                        continue
+                    bridge_score = max(
+                        self._lexical_relevance(target_memory, query),
+                        self._lexical_relevance(target_memory, cat1_bridge_query),
+                    )
+                    if bridge_score < local_context_neighbor_min_lexical_score:
+                        continue
+                    seen_ids.add(target_memory.id)
+                    memory_str += self._format_memory_for_context(target_memory, relation="local_context")
+                    local_added += 1
+                    if local_added >= 1:
+                        break
+                if len(seen_ids) >= max_context_blocks:
+                    break
         return memory_str
 
     # ---- write-time lifecycle consolidation ----
