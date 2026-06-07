@@ -146,8 +146,8 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v4_stronger_fallback"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v2_stronger_fallback"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v5_source_aware_category_policy"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v3_source_aware_category_policy"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
@@ -577,6 +577,7 @@ class RobustAgenticMemorySystem:
         self.final_bundle_size = max(1, int(final_bundle_size))
         self.final_bundle_max_size = max(self.final_bundle_size, int(final_bundle_max_size))
         self.offline_domain_tree: List[Dict[str, Any]] = []
+        self.last_candidate_debug: List[Dict[str, Any]] = []
         self.retrieval_index_version = RETRIEVAL_INDEX_VERSION
 
     @staticmethod
@@ -1339,10 +1340,15 @@ Rules:
         query: str,
         k: int,
         routed_domains: Optional[List[str]],
+        category: Optional[int] = None,
     ) -> List[tuple]:
         all_memories = list(self.memories.values())
         if not all_memories:
             return []
+        try:
+            category_int = int(category) if category is not None else None
+        except (TypeError, ValueError):
+            category_int = None
 
         candidate_indices = []
         fallback_indices = []
@@ -1361,8 +1367,33 @@ Rules:
         embedding_ranked = self._embedding_rank_indices(query, candidate_indices, domain_top_k)
         bm25_ranked = self._bm25_rank_indices(query, candidate_indices, domain_top_k)
 
-        seed_indices: Set[int] = set(idx for _, idx in embedding_ranked)
-        seed_indices.update(idx for _, idx in bm25_ranked)
+        candidate_scores: Dict[int, Dict[str, Any]] = {}
+
+        def _entry(idx: int) -> Dict[str, Any]:
+            return candidate_scores.setdefault(idx, {
+                "domain_embedding": 0.0,
+                "domain_bm25": 0.0,
+                "domain_lexical": 0.0,
+                "global_embedding": 0.0,
+                "global_bm25": 0.0,
+                "global_entity": 0.0,
+                "domain_match": 0.0,
+                "source_tags": set(),
+            })
+
+        def _rank_score(score: float, rank: int, cap: float = 1.0) -> float:
+            capped = min(float(score), cap) / max(cap, 1e-6)
+            return max(capped, 1.0 / (rank + 1))
+
+        for rank, (score, idx) in enumerate(embedding_ranked):
+            item = _entry(idx)
+            item["domain_embedding"] = max(item["domain_embedding"], _rank_score(score, rank, cap=1.0))
+            item["source_tags"].add("domain_embedding")
+        bm25_cap = max((score for score, _ in bm25_ranked), default=1.0) or 1.0
+        for rank, (score, idx) in enumerate(bm25_ranked):
+            item = _entry(idx)
+            item["domain_bm25"] = max(item["domain_bm25"], _rank_score(score, rank, cap=bm25_cap))
+            item["source_tags"].add("domain_bm25")
 
         lexical_ranked = []
         for idx in candidate_indices:
@@ -1370,58 +1401,114 @@ Rules:
             if lexical > 0.0:
                 lexical_ranked.append((lexical, idx))
         lexical_ranked.sort(reverse=True)
-        seed_indices.update(idx for _, idx in lexical_ranked[:domain_top_k])
+        lexical_cap = max((score for score, _ in lexical_ranked[:domain_top_k]), default=1.0) or 1.0
+        for rank, (score, idx) in enumerate(lexical_ranked[:domain_top_k]):
+            item = _entry(idx)
+            item["domain_lexical"] = max(item["domain_lexical"], _rank_score(score, rank, cap=lexical_cap))
+            item["source_tags"].add("domain_lexical")
 
         if self.global_fallback_top_k:
             global_embedding = self._embedding_rank_indices(query, fallback_indices, self.global_fallback_top_k)
             global_bm25 = self._bm25_rank_indices(query, fallback_indices, self.global_bm25_top_k)
             global_entity = self._entity_rank_indices(query, fallback_indices, self.global_entity_top_k)
-            global_scored: Dict[int, float] = {}
             for rank, (score, idx) in enumerate(global_embedding):
-                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + score)
+                item = _entry(idx)
+                item["global_embedding"] = max(item["global_embedding"], _rank_score(score, rank, cap=1.0))
+                item["source_tags"].add("global_embedding")
+            global_bm25_cap = max((score for score, _ in global_bm25), default=1.0) or 1.0
             for rank, (score, idx) in enumerate(global_bm25):
-                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + min(score, 5.0) / 5.0)
+                item = _entry(idx)
+                item["global_bm25"] = max(item["global_bm25"], _rank_score(score, rank, cap=global_bm25_cap))
+                item["source_tags"].add("global_bm25")
+            global_entity_cap = max((score for score, _ in global_entity), default=1.0) or 1.0
             for rank, (score, idx) in enumerate(global_entity):
-                global_scored[idx] = max(global_scored.get(idx, 0.0), 1.0 / (rank + 1) + min(score, 10.0) / 10.0)
-            for idx, _ in sorted(
-                global_scored.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:max(self.global_bm25_top_k, self.global_entity_top_k, self.global_fallback_top_k)]:
-                seed_indices.add(idx)
-
-        embedding_scores = {idx: score for score, idx in embedding_ranked}
-        bm25_scores = {idx: score for score, idx in bm25_ranked}
-        if bm25_scores:
-            max_bm25 = max(bm25_scores.values()) or 1.0
-        else:
-            max_bm25 = 1.0
+                item = _entry(idx)
+                item["global_entity"] = max(item["global_entity"], _rank_score(score, rank, cap=global_entity_cap))
+                item["source_tags"].add("global_entity")
 
         ranked = []
         query_domains = routed_domains or []
-        for order, idx in enumerate(seed_indices):
+        session_counts: Dict[int, int] = {}
+        for order, idx in enumerate(candidate_scores.keys()):
             if idx >= len(all_memories):
                 continue
             memory = self._ensure_memory_schema(all_memories[idx])
             if not self._is_retrievable(memory, query):
                 continue
+            score_parts = candidate_scores[idx]
             lexical_score = self._lexical_relevance(memory, query)
-            embedding_score = max(0.0, embedding_scores.get(idx, 0.0))
-            bm25_score = bm25_scores.get(idx, 0.0) / max_bm25
             domain_score = 1.0 if self._domain_overlap(memory, query_domains) else 0.0
+            score_parts["domain_match"] = domain_score
             reliability = self.memory_reliability(memory)
             citation_score = math.log1p(float(getattr(memory, "citation_count", 0))) / 5.0
+            lexical_norm = min(1.0, lexical_score / 8.0)
+            if category_int == 4:
+                weights = {
+                    "domain_embedding": 0.10,
+                    "domain_bm25": 0.15,
+                    "domain_lexical": 0.15,
+                    "global_embedding": 0.05,
+                    "global_bm25": 0.30,
+                    "global_entity": 0.25,
+                    "domain_match": 0.05,
+                    "lexical": 0.20,
+                }
+            elif category_int == 1:
+                weights = {
+                    "domain_embedding": 0.18,
+                    "domain_bm25": 0.18,
+                    "domain_lexical": 0.18,
+                    "global_embedding": 0.07,
+                    "global_bm25": 0.22,
+                    "global_entity": 0.18,
+                    "domain_match": 0.08,
+                    "lexical": 0.18,
+                }
+            else:
+                weights = {
+                    "domain_embedding": 0.25,
+                    "domain_bm25": 0.18,
+                    "domain_lexical": 0.12,
+                    "global_embedding": 0.08,
+                    "global_bm25": 0.18,
+                    "global_entity": 0.14,
+                    "domain_match": 0.10,
+                    "lexical": 0.18,
+                }
+            session_bonus = 0.0
+            dia_key = self._dia_sort_key(self._dia_id_for_memory(memory) or "")
+            if category_int == 1 and dia_key:
+                # Small diversity bonus during ordering so multi-hop candidates do not all come from one session.
+                session_bonus = max(0.0, 0.04 - 0.02 * session_counts.get(dia_key[0], 0))
             combined_score = (
-                0.35 * embedding_score
-                + 0.25 * min(1.0, lexical_score / 8.0)
-                + 0.20 * min(1.0, bm25_score)
-                + 0.10 * domain_score
+                weights["domain_embedding"] * score_parts["domain_embedding"]
+                + weights["domain_bm25"] * score_parts["domain_bm25"]
+                + weights["domain_lexical"] * score_parts["domain_lexical"]
+                + weights["global_embedding"] * score_parts["global_embedding"]
+                + weights["global_bm25"] * score_parts["global_bm25"]
+                + weights["global_entity"] * score_parts["global_entity"]
+                + weights["domain_match"] * score_parts["domain_match"]
+                + weights["lexical"] * lexical_norm
                 + 0.07 * reliability
                 + 0.03 * min(1.0, citation_score)
+                + session_bonus
             )
+            if dia_key:
+                session_counts[dia_key[0]] = session_counts.get(dia_key[0], 0) + 1
+            debug_parts = dict(score_parts)
+            debug_parts["source_tags"] = sorted(debug_parts.get("source_tags", []))
+            debug_parts["combined_score"] = combined_score
+            debug_parts["lexical_score"] = lexical_score
+            debug_parts["dia_id"] = self._dia_id_for_memory(memory)
+            debug_parts["memory_id"] = memory.id
+            candidate_scores[idx] = debug_parts
             ranked.append((self.lifecycle_penalty(memory), -combined_score, order, idx, memory))
 
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+        self.last_candidate_debug = [
+            candidate_scores.get(item[3], {})
+            for item in ranked[: max(k * 3, self.final_bundle_max_size)]
+        ]
         return ranked
 
     def _memory_to_index_text(self, memory: RobustMemoryNote) -> str:
@@ -1742,6 +1829,7 @@ Rules:
         k: int = 5,
         routed_domains: Optional[List[str]] = None,
         route_domain: bool = True,
+        category: Optional[int] = None,
     ) -> tuple:
         """Find related memories using embedding retrieval."""
         if not self.memories:
@@ -1751,7 +1839,7 @@ Rules:
             routed_domains = self.route_domains(query)
         all_memories = list(self.memories.values())
         memory_str = ""
-        ranked = self._retrieval_candidates(query, k, routed_domains)
+        ranked = self._retrieval_candidates(query, k, routed_domains, category=category)
         filtered_indices = []
         for _, _, _, i, memory in ranked[:k]:
             filtered_indices.append(i)
@@ -1774,6 +1862,7 @@ Rules:
         k: int = 5,
         routed_domains: Optional[List[str]] = None,
         route_domain: bool = True,
+        category: Optional[int] = None,
     ) -> str:
         """Find related memories with neighborhood expansion."""
         if not self.memories:
@@ -1781,12 +1870,16 @@ Rules:
 
         if route_domain and routed_domains is None:
             routed_domains = self.route_domains(query)
+        try:
+            category_int = int(category) if category is not None else None
+        except (TypeError, ValueError):
+            category_int = None
         all_memories = list(self.memories.values())
         id_to_memory = {memory.id: self._ensure_memory_schema(memory) for memory in all_memories}
         dia_lookup = self._build_dia_lookup(all_memories)
         memory_str = ""
         seen_ids = set()
-        ranked = self._retrieval_candidates(query, k, routed_domains)
+        ranked = self._retrieval_candidates(query, k, routed_domains, category=category_int)
         primary_count = 0
         primary_limit = min(k, self.final_bundle_size)
         max_context_blocks = max(primary_limit, self.final_bundle_max_size)
@@ -1830,6 +1923,7 @@ Rules:
 
             neighbor_count = 0
             same_character_count = 0
+            similar_event_count = 0
             sorted_edges = sorted(
                 getattr(memory, "links", []),
                 key=lambda edge: (
@@ -1848,8 +1942,16 @@ Rules:
                     or target_memory.id in seen_ids
                 ):
                     continue
+                if relation == "similar_event":
+                    if category_int == 4:
+                        continue
+                    if similar_event_count >= 1:
+                        continue
+                    if self._lexical_relevance(target_memory, query) < 1.0:
+                        continue
+                    similar_event_count += 1
                 if relation == "same_character":
-                    if same_character_count >= 2:
+                    if category_int == 4 or same_character_count >= 1:
                         continue
                     same_character_count += 1
                 seen_ids.add(target_memory.id)

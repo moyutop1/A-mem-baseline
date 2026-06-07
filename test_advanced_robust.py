@@ -95,8 +95,8 @@ class RobustAdvancedMemAgent:
     def add_memory(self, content, time=None, **kwargs):
         self.memory_system.add_note(content, time=time, **kwargs)
 
-    def retrieve_memory(self, content, k=10):
-        return self.memory_system.find_related_memories_raw(content, k=k)
+    def retrieve_memory(self, content, k=10, category=None):
+        return self.memory_system.find_related_memories_raw(content, k=k, category=category)
 
     @staticmethod
     def build_retrieval_query(question: str, keywords: str) -> str:
@@ -354,7 +354,7 @@ Keywords:"""
         """Generate answer for a question — plain text, no JSON schema."""
         keywords = self.generate_query_llm(question)
         retrieval_query = self.build_retrieval_query(question, keywords)
-        raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k)
+        raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k, category=category)
         context = (
             self.retrieve_memory_llm(raw_context, question)
             if int(category) in self.compress_categories

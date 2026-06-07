@@ -760,3 +760,39 @@ Version: robust_retrieval_v4_stronger_fallback
 
 4. Bump retrieval and domain-graph cache versions so old caches are rebuilt.
 ```
+
+Implemented v5 patch:
+
+```text
+Version: robust_retrieval_v5_source_aware_category_policy
+
+1. Replace seed_indices set with a source-aware candidate score table.
+   Each candidate now keeps:
+   - domain_embedding
+   - domain_bm25
+   - domain_lexical
+   - global_embedding
+   - global_bm25
+   - global_entity
+   - domain_match
+   - source_tags
+
+2. Global fallback scores now participate in final reranking.
+   This fixes the v4 issue where global fallback could add candidates but their
+   BM25/entity strength was not preserved in the final score.
+
+3. Add category-aware retrieval weights:
+   - Category 1: balance domain and global evidence, with a small session diversity bonus.
+   - Category 4: emphasize global_bm25 and global_entity; weaken broad embedding/domain signals.
+   - Category 2: keep a balanced policy for now.
+
+4. Limit graph expansion by category:
+   - Category 4 skips similar_event and same_character expansion by default.
+   - Other categories allow at most one similar_event expansion per primary seed.
+   - similar_event target must have lexical overlap with the query.
+
+5. Store source-aware retrieval diagnostics in memory_system.last_candidate_debug.
+   These diagnostics are not injected into the prompt, but can be logged later.
+
+6. Bump retrieval and domain graph cache versions so old v4 caches are rebuilt.
+```
