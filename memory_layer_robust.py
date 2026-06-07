@@ -137,6 +137,15 @@ STABLE_RETRIEVAL_EDGES = {
     "similar_event",
     "same_character",
     "temporal_anchor",
+    "same_storyline",
+    "same_answer_slot",
+    "shared_activity",
+    "shared_artifact",
+    "temporal_followup",
+    "before_after",
+    "clarifies_answer",
+    "image_text_pair",
+    "local_evidence_pair",
     "supports",
     "derived_from",
 }
@@ -147,7 +156,7 @@ DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 RETRIEVAL_INDEX_VERSION = "robust_retrieval_v5_source_aware_category_policy"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v3_source_aware_category_policy"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v4_typed_evidence_edges"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
@@ -1036,8 +1045,26 @@ Rules:
             if marker in lowered
         ]
 
+    def _offline_graph_relations(self) -> Set[str]:
+        return {
+            "similar_event",
+            "same_character",
+            "temporal_anchor",
+            "same_storyline",
+            "same_answer_slot",
+            "shared_activity",
+            "shared_artifact",
+            "temporal_followup",
+            "before_after",
+            "clarifies_answer",
+            "image_text_pair",
+            "local_evidence_pair",
+            "supports",
+            "derived_from",
+        }
+
     def _clear_offline_graph_edges(self) -> None:
-        offline_relations = {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"}
+        offline_relations = self._offline_graph_relations()
         for memory in self.memories.values():
             memory = self._ensure_memory_schema(memory)
             memory.links = [
@@ -1053,6 +1080,77 @@ Rules:
             fields.get("image_query", ""),
             " ".join(getattr(memory, "domain_paths", [])),
         ]).strip()
+
+    def _typed_edge_profile(self, memory: RobustMemoryNote) -> Dict[str, Set[str]]:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        text = " ".join([
+            fields.get("speaker", ""),
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+            getattr(memory, "context", ""),
+            " ".join(getattr(memory, "keywords", [])),
+            " ".join(getattr(memory, "tags", [])),
+            " ".join(getattr(memory, "domain_paths", [])),
+        ]).lower()
+
+        def hits(mapping: Dict[str, Set[str]]) -> Set[str]:
+            found = set()
+            tokens = self._retrieval_tokens(text)
+            for label, terms in mapping.items():
+                for term in terms:
+                    canonical = self._canonical_token(term)
+                    if term in text or canonical in tokens:
+                        found.add(label)
+                        break
+            return found
+
+        storylines = hits({
+            "lgbtq": {"lgbtq", "transgender", "trans", "pride", "support group", "coming out", "womanhood", "transition"},
+            "community_help": {"mentor", "mentorship", "youth", "children", "community", "school", "speech", "talk", "activist"},
+            "family_kids": {"family", "kids", "children", "son", "daughter", "parent", "mom"},
+            "art": {"art", "painting", "painted", "artwork", "show", "portrait", "sunset", "identity"},
+            "outdoors": {"camping", "camp", "hike", "hiking", "beach", "mountain", "forest", "roadtrip", "trip"},
+            "career_health": {"career", "counseling", "mental health", "therapeutic", "workshop", "support"},
+            "adoption": {"adoption", "agency", "single parent", "adopt"},
+            "books_music": {"book", "read", "concert", "music", "band", "artist", "song"},
+            "pets_items": {"pet", "pets", "luna", "oliver", "bought", "shoes", "necklace"},
+        })
+        slots = hits({
+            "event": {"event", "attended", "joined", "participated", "parade", "workshop", "group", "meeting", "show", "program"},
+            "activity": {"activity", "pottery", "swimming", "camping", "hiking", "running", "painting", "frisbee"},
+            "person_support": {"support", "supports", "friends", "family", "mentors", "encouragement", "help"},
+            "place": {"where", "country", "sweden", "beach", "mountain", "forest", "home"},
+            "count": {"how many", "number", "times", "children", "kids"},
+            "artifact": {"painting", "book", "pet", "necklace", "shoes", "pottery", "instrument", "item"},
+            "time": {"yesterday", "last week", "next month", "last friday", "recently", "weekend", "past weekend"},
+        })
+        activities = hits({
+            "pottery": {"pottery", "clay"},
+            "painting": {"painting", "painted", "artwork", "sunset", "portrait"},
+            "camping": {"camping", "campfire", "camped", "camp"},
+            "hiking": {"hiking", "hike", "trail"},
+            "swimming": {"swimming", "swim"},
+            "running": {"running", "run"},
+            "beach": {"beach"},
+            "music": {"concert", "music", "band", "artist", "song"},
+            "book": {"book", "read", "novel"},
+        })
+        artifacts = hits({
+            "painting": {"painting", "painted", "artwork", "canvas"},
+            "pottery": {"pottery", "clay"},
+            "book": {"book", "novel"},
+            "pets": {"luna", "oliver", "pets", "pet"},
+            "necklace": {"necklace"},
+            "shoes": {"shoes", "sneakers"},
+            "instrument": {"violin", "clarinet", "instrument"},
+        })
+        return {
+            "storylines": storylines,
+            "slots": slots,
+            "activities": activities,
+            "artifacts": artifacts,
+        }
 
     def _shared_domain(self, left: RobustMemoryNote, right: RobustMemoryNote) -> bool:
         left_domains = set(getattr(left, "domain_paths", []) or [])
@@ -1080,6 +1178,7 @@ Rules:
 
         dia_keys = [self._dia_sort_key(self._dia_id_for_memory(memory) or "") for memory in memories]
         speakers = [self._speaker_for_memory(memory) for memory in memories]
+        profiles = [self._typed_edge_profile(memory) for memory in memories]
         by_speaker: Dict[str, List[int]] = {}
         for idx, speaker in enumerate(speakers):
             if speaker:
@@ -1093,7 +1192,21 @@ Rules:
                 self._add_edge(right, left, "same_character", "Adjacent memories from the same LoCoMo speaker.", 0.4)
 
         similar_counts: Dict[str, int] = {}
+        typed_counts: Dict[str, int] = {}
         max_similar_edges_per_memory = 4
+        max_typed_edges_per_memory = 8
+
+        def add_typed_edge(
+            left: RobustMemoryNote,
+            right: RobustMemoryNote,
+            relation: str,
+            reason: str,
+            strength: float,
+        ) -> None:
+            if typed_counts.get(left.id, 0) >= max_typed_edges_per_memory:
+                return
+            self._add_edge(left, right, relation, reason, strength)
+            typed_counts[left.id] = typed_counts.get(left.id, 0) + 1
 
         for i, left in enumerate(memories):
             left_tokens = self._retrieval_tokens(event_texts[i])
@@ -1103,12 +1216,11 @@ Rules:
                 right_key = dia_keys[j]
                 same_character = bool(speakers[i] and speakers[i] == speakers[j])
 
-                if similar_counts.get(left.id, 0) >= max_similar_edges_per_memory:
-                    continue
-                if similar_counts.get(right.id, 0) >= max_similar_edges_per_memory:
-                    continue
-                if not self._shared_domain(left, right):
-                    continue
+                allow_similar_event = (
+                    similar_counts.get(left.id, 0) < max_similar_edges_per_memory
+                    and similar_counts.get(right.id, 0) < max_similar_edges_per_memory
+                    and self._shared_domain(left, right)
+                )
                 right_tokens = self._retrieval_tokens(event_texts[j])
                 overlap = len(left_tokens & right_tokens)
                 if event_embeddings[i] is not None and event_embeddings[j] is not None:
@@ -1127,21 +1239,65 @@ Rules:
                     and same_character
                     and overlap >= 2
                 )
-                if same_session_nearby and (overlap >= 1 or similarity >= 0.55):
+                if allow_similar_event and same_session_nearby and (overlap >= 1 or similarity >= 0.55):
                     weight = 1.0
-                elif cross_session_event and similarity >= 0.45:
+                elif allow_similar_event and cross_session_event and similarity >= 0.45:
                     weight = 0.6
                 else:
-                    continue
-                self._add_edge(left, right, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
-                self._add_edge(right, left, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
-                similar_counts[left.id] = similar_counts.get(left.id, 0) + 1
-                similar_counts[right.id] = similar_counts.get(right.id, 0) + 1
+                    weight = 0.0
+                if weight > 0.0:
+                    self._add_edge(left, right, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
+                    self._add_edge(right, left, "similar_event", "Rule and embedding based LoCoMo event match.", weight)
+                    similar_counts[left.id] = similar_counts.get(left.id, 0) + 1
+                    similar_counts[right.id] = similar_counts.get(right.id, 0) + 1
+
+                left_profile = profiles[i]
+                right_profile = profiles[j]
+                shared_storylines = left_profile["storylines"] & right_profile["storylines"]
+                shared_slots = left_profile["slots"] & right_profile["slots"]
+                shared_activities = left_profile["activities"] & right_profile["activities"]
+                shared_artifacts = left_profile["artifacts"] & right_profile["artifacts"]
+                same_or_related_speaker = same_character or bool(shared_storylines & {"family_kids", "lgbtq", "art"})
+                chronological_pair = (
+                    left_key is not None and right_key is not None
+                    and left_key[0] != right_key[0]
+                    and left_key < right_key
+                )
+
+                if shared_storylines and same_or_related_speaker and (overlap >= 1 or similarity >= 0.35):
+                    reason = "Shared typed LoCoMo storyline: " + ", ".join(sorted(shared_storylines)[:3])
+                    add_typed_edge(left, right, "same_storyline", reason, 0.72)
+                    add_typed_edge(right, left, "same_storyline", reason, 0.72)
+                if shared_slots and (shared_storylines or same_character) and (overlap >= 1 or similarity >= 0.30):
+                    reason = "Shared likely answer slot: " + ", ".join(sorted(shared_slots)[:3])
+                    add_typed_edge(left, right, "same_answer_slot", reason, 0.68)
+                    add_typed_edge(right, left, "same_answer_slot", reason, 0.68)
+                if shared_activities and (same_character or shared_storylines) and (overlap >= 1 or similarity >= 0.30):
+                    reason = "Shared activity evidence: " + ", ".join(sorted(shared_activities)[:3])
+                    add_typed_edge(left, right, "shared_activity", reason, 0.74)
+                    add_typed_edge(right, left, "shared_activity", reason, 0.74)
+                if shared_artifacts and (same_character or shared_storylines) and (overlap >= 1 or similarity >= 0.30):
+                    reason = "Shared artifact evidence: " + ", ".join(sorted(shared_artifacts)[:3])
+                    add_typed_edge(left, right, "shared_artifact", reason, 0.70)
+                    add_typed_edge(right, left, "shared_artifact", reason, 0.70)
+                if chronological_pair and (shared_storylines or shared_activities or shared_artifacts) and (same_character or overlap >= 1):
+                    reason = "Chronological follow-up within a shared typed evidence chain."
+                    add_typed_edge(left, right, "temporal_followup", reason, 0.62)
+                    add_typed_edge(right, left, "before_after", reason, 0.54)
+                if same_session_nearby and overlap >= 1:
+                    reason = "Nearby turn that may clarify the selected evidence."
+                    add_typed_edge(left, right, "local_evidence_pair", reason, 0.45)
+                    add_typed_edge(right, left, "local_evidence_pair", reason, 0.45)
+                if same_session_nearby and (left_profile["artifacts"] or right_profile["artifacts"]):
+                    reason = "Nearby image/text evidence pair around an artifact or visual cue."
+                    add_typed_edge(left, right, "image_text_pair", reason, 0.42)
+                    add_typed_edge(right, left, "image_text_pair", reason, 0.42)
 
     def _domain_graph_cache_payload(self, sample_id: str) -> Dict[str, Any]:
         annotations = {}
         temporal = {}
         edges = {}
+        offline_relations = self._offline_graph_relations()
         for memory in self.memories.values():
             memory = self._ensure_memory_schema(memory)
             dia_id = self._dia_id_for_memory(memory) or memory.id
@@ -1150,7 +1306,7 @@ Rules:
             edges[dia_id] = [
                 edge for edge in getattr(memory, "links", [])
                 if isinstance(edge, dict)
-                and edge.get("relation") in {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"}
+                and edge.get("relation") in offline_relations
             ]
         return {
             "version": DOMAIN_GRAPH_CACHE_VERSION,
@@ -1169,6 +1325,7 @@ Rules:
         annotations = payload.get("annotations", {}) or {}
         temporal = payload.get("temporal_expressions", {}) or {}
         edges = payload.get("edges", {}) or {}
+        offline_relations = self._offline_graph_relations()
         id_by_dia = {}
         for memory in self.memories.values():
             memory = self._ensure_memory_schema(memory)
@@ -1181,7 +1338,7 @@ Rules:
             memory.temporal_expressions = temporal.get(dia_id, getattr(memory, "temporal_expressions", []))
             memory.links = [
                 edge for edge in getattr(memory, "links", [])
-                if not (isinstance(edge, dict) and edge.get("relation") in {"similar_event", "same_character", "temporal_anchor", "supports", "derived_from"})
+                if not (isinstance(edge, dict) and edge.get("relation") in offline_relations)
             ]
         for dia_id, edge_list in edges.items():
             source = id_by_dia.get(dia_id)
@@ -1432,6 +1589,7 @@ Rules:
                 "global_embedding": 0.0,
                 "global_bm25": 0.0,
                 "global_entity": 0.0,
+                "graph_expansion": 0.0,
                 "domain_match": 0.0,
                 "source_tags": set(),
             })
@@ -1488,6 +1646,109 @@ Rules:
                 item["global_entity"] = max(item["global_entity"], _rank_score(score, rank, cap=global_entity_cap))
                 item["source_tags"].add("global_entity")
 
+        id_to_idx = {
+            self._ensure_memory_schema(memory).id: idx
+            for idx, memory in enumerate(all_memories)
+        }
+        relation_weights = {
+            "same_storyline": 0.95,
+            "same_answer_slot": 0.90,
+            "shared_activity": 0.95,
+            "shared_artifact": 0.90,
+            "temporal_followup": 0.85,
+            "before_after": 0.78,
+            "temporal_anchor": 0.80,
+            "similar_event": 0.72,
+            "local_evidence_pair": 0.55,
+            "image_text_pair": 0.55,
+            "clarifies_answer": 0.60,
+            "supports": 0.70,
+            "derived_from": 0.65,
+        }
+        if category_int == 1:
+            allowed_graph_relations = {
+                "same_storyline", "same_answer_slot", "shared_activity",
+                "shared_artifact", "temporal_followup", "similar_event",
+                "supports", "derived_from",
+            }
+            seed_limit, per_seed_limit, graph_candidate_limit = 20, 3, 36
+        elif category_int == 2:
+            allowed_graph_relations = {
+                "temporal_followup", "before_after", "temporal_anchor",
+                "similar_event", "local_evidence_pair",
+            }
+            seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 14
+        elif category_int == 4:
+            allowed_graph_relations = {
+                "clarifies_answer", "image_text_pair", "local_evidence_pair",
+                "shared_artifact",
+            }
+            seed_limit, per_seed_limit, graph_candidate_limit = 8, 1, 8
+        else:
+            allowed_graph_relations = {
+                "same_storyline", "same_answer_slot", "similar_event",
+                "local_evidence_pair",
+            }
+            seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 12
+
+        def _pre_graph_score(item: Dict[str, Any]) -> float:
+            return (
+                0.25 * item.get("domain_embedding", 0.0)
+                + 0.20 * item.get("domain_bm25", 0.0)
+                + 0.16 * item.get("domain_lexical", 0.0)
+                + 0.12 * item.get("global_embedding", 0.0)
+                + 0.20 * item.get("global_bm25", 0.0)
+                + 0.18 * item.get("global_entity", 0.0)
+            )
+
+        seed_indices = [
+            idx for idx, _ in sorted(
+                candidate_scores.items(),
+                key=lambda pair: _pre_graph_score(pair[1]),
+                reverse=True,
+            )[:seed_limit]
+        ]
+        graph_added = 0
+        for seed_idx in seed_indices:
+            if seed_idx >= len(all_memories) or graph_added >= graph_candidate_limit:
+                continue
+            seed_memory = self._ensure_memory_schema(all_memories[seed_idx])
+            seed_score = max(0.15, _pre_graph_score(candidate_scores.get(seed_idx, {})))
+            edge_items = []
+            for edge in getattr(seed_memory, "links", []) or []:
+                if not isinstance(edge, dict):
+                    continue
+                relation = self._edge_relation(edge)
+                if relation not in allowed_graph_relations:
+                    continue
+                target_id = edge.get("target_id")
+                target_idx = id_to_idx.get(target_id)
+                if target_idx is None or target_idx == seed_idx or target_idx >= len(all_memories):
+                    continue
+                target_memory = self._ensure_memory_schema(all_memories[target_idx])
+                if not self._is_retrievable(target_memory, query):
+                    continue
+                lexical = self._lexical_relevance(target_memory, lexical_query)
+                if category_int == 4 and lexical < 1.0:
+                    continue
+                if category_int == 2 and relation not in {"temporal_followup", "before_after", "temporal_anchor"} and lexical < 1.0:
+                    continue
+                strength = float(edge.get("strength", 0.5))
+                relation_weight = relation_weights.get(relation, 0.4)
+                graph_score = seed_score * strength * relation_weight * (1.0 + min(1.0, lexical / 8.0))
+                edge_items.append((graph_score, relation, target_idx))
+            edge_items.sort(reverse=True)
+            per_seed_added = 0
+            for graph_score, relation, target_idx in edge_items:
+                item = _entry(target_idx)
+                if graph_score > item["graph_expansion"]:
+                    item["graph_expansion"] = graph_score
+                    item["source_tags"].add(f"graph_{relation}")
+                per_seed_added += 1
+                graph_added += 1
+                if per_seed_added >= per_seed_limit or graph_added >= graph_candidate_limit:
+                    break
+
         ranked = []
         query_domains = routed_domains or []
         session_counts: Dict[int, int] = {}
@@ -1512,6 +1773,7 @@ Rules:
                     "global_embedding": 0.05,
                     "global_bm25": 0.30,
                     "global_entity": 0.25,
+                    "graph_expansion": 0.05,
                     "domain_match": 0.05,
                     "lexical": 0.20,
                 }
@@ -1523,6 +1785,7 @@ Rules:
                     "global_embedding": 0.07,
                     "global_bm25": 0.22,
                     "global_entity": 0.18,
+                    "graph_expansion": 0.18,
                     "domain_match": 0.08,
                     "lexical": 0.18,
                 }
@@ -1534,6 +1797,7 @@ Rules:
                     "global_embedding": 0.08,
                     "global_bm25": 0.18,
                     "global_entity": 0.14,
+                    "graph_expansion": 0.10,
                     "domain_match": 0.10,
                     "lexical": 0.18,
                 }
@@ -1549,6 +1813,7 @@ Rules:
                 + weights["global_embedding"] * score_parts["global_embedding"]
                 + weights["global_bm25"] * score_parts["global_bm25"]
                 + weights["global_entity"] * score_parts["global_entity"]
+                + weights["graph_expansion"] * min(1.0, score_parts["graph_expansion"])
                 + weights["domain_match"] * score_parts["domain_match"]
                 + weights["lexical"] * lexical_norm
                 + 0.07 * reliability
@@ -2294,12 +2559,17 @@ Rules:
             )
             if not allow_expansion:
                 sorted_edges = []
+            direct_context_relations = {
+                "similar_event", "same_character", "temporal_anchor",
+                "supports", "derived_from",
+            }
             for edge in sorted_edges:
                 target_memory = self._edge_to_memory(edge, all_memories, id_to_memory)
                 relation = self._edge_relation(edge)
                 if (
                     not target_memory
                     or relation not in STABLE_RETRIEVAL_EDGES
+                    or relation not in direct_context_relations
                     or not self._is_retrievable(target_memory, query)
                     or not self._domain_overlap(target_memory, routed_domains)
                     or target_memory.id in seen_ids
