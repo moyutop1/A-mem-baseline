@@ -155,7 +155,7 @@ DEFAULT_GLOBAL_BM25_TOP_K = 15
 DEFAULT_GLOBAL_ENTITY_TOP_K = 10
 DEFAULT_FINAL_BUNDLE_SIZE = 6
 DEFAULT_FINAL_BUNDLE_MAX_SIZE = 8
-DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 12
+DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 16
 DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 16
 DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K = 40
 
@@ -1410,6 +1410,11 @@ Rules:
 
         if not candidate_indices:
             candidate_indices = fallback_indices
+        if category_int == 1:
+            # Cat1 multi-evidence questions are sensitive to early router misses.
+            # Keep domain_match as a reranking feature, but never let domain routing
+            # exclude otherwise strong global lexical/dense evidence candidates.
+            candidate_indices = fallback_indices
 
         domain_top_k = max(self.domain_seed_top_k, k * 4)
         if category_int == 1:
@@ -1458,12 +1463,14 @@ Rules:
             item["source_tags"].add("domain_lexical")
 
         if self.global_fallback_top_k:
-            global_embedding = self._embedding_rank_indices(query, fallback_indices, self.global_fallback_top_k)
+            global_embedding_top_k = self.global_fallback_top_k
             global_bm25_top_k = self.global_bm25_top_k
             global_entity_top_k = self.global_entity_top_k
             if category_int == 1:
+                global_embedding_top_k = max(global_embedding_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
                 global_bm25_top_k = max(global_bm25_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
                 global_entity_top_k = max(global_entity_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
+            global_embedding = self._embedding_rank_indices(query, fallback_indices, global_embedding_top_k)
             global_bm25 = self._bm25_rank_indices(lexical_query, fallback_indices, global_bm25_top_k)
             global_entity = self._entity_rank_indices(lexical_query, fallback_indices, global_entity_top_k)
             for rank, (score, idx) in enumerate(global_embedding):
@@ -2221,7 +2228,6 @@ Rules:
         local_context_primary_limit = 2
         local_context_min_lexical_score = 2.0
         local_context_neighbor_min_lexical_score = 1.0
-        selected_primary_memories: List[RobustMemoryNote] = []
         relation_priority = {
             "similar_event": 0,
             "temporal_anchor": 1,
@@ -2252,7 +2258,6 @@ Rules:
                 continue
             seen_ids.add(memory.id)
             memory_str += self._format_memory_for_context(memory)
-            selected_primary_memories.append(memory)
             primary_count += 1
 
             lexical_score = self._lexical_relevance(memory, query)
@@ -2320,30 +2325,6 @@ Rules:
                     break
             if primary_count >= primary_limit or len(seen_ids) >= max_context_blocks:
                 break
-        if category_int == 1 and len(seen_ids) < max_context_blocks:
-            cat1_bridge_query = self._category1_query_expansion(query)
-            for memory in selected_primary_memories[:4]:
-                local_added = 0
-                for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=2):
-                    if (
-                        not self._is_retrievable(target_memory, query)
-                        or target_memory.id in seen_ids
-                        or len(seen_ids) >= max_context_blocks
-                    ):
-                        continue
-                    bridge_score = max(
-                        self._lexical_relevance(target_memory, query),
-                        self._lexical_relevance(target_memory, cat1_bridge_query),
-                    )
-                    if bridge_score < local_context_neighbor_min_lexical_score:
-                        continue
-                    seen_ids.add(target_memory.id)
-                    memory_str += self._format_memory_for_context(target_memory, relation="local_context")
-                    local_added += 1
-                    if local_added >= 1:
-                        break
-                if len(seen_ids) >= max_context_blocks:
-                    break
         return memory_str
 
     # ---- write-time lifecycle consolidation ----
