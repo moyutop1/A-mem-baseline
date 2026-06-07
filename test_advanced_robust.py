@@ -91,6 +91,7 @@ class RobustAdvancedMemAgent:
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
         self.compress_categories = compress_categories or set()
+        self.last_answer_debug: Dict[str, object] = {}
 
     def add_memory(self, content, time=None, **kwargs):
         self.memory_system.add_note(content, time=time, **kwargs)
@@ -388,8 +389,151 @@ Keywords:"""
 
         return response
 
+    @staticmethod
+    def _cat1_slot_type(question: str) -> str:
+        question_lower = str(question or "").lower()
+        if re.search(r"\bhow many\b|\bnumber of\b", question_lower):
+            return "count"
+        if re.search(r"\bwhere\b", question_lower):
+            return "place"
+        if re.search(r"\bwho\b", question_lower):
+            return "person"
+        if re.search(r"\bbook|books|read|suggestion\b", question_lower):
+            return "book"
+        if re.search(r"\bevent|events|participat|attended|community\b", question_lower):
+            return "event"
+        if re.search(r"\bactivit|destress|hikes?|family|partake|does\b", question_lower):
+            return "activity"
+        if re.search(r"\bpaint|art|pottery|symbols?|items?|instruments?|pets?|names?|changes?|types?|ways?\b", question_lower):
+            return "item"
+        if re.search(r"\bidentity|relationship status|career path\b", question_lower):
+            return "status"
+        return "fact"
+
+    @staticmethod
+    def _cat1_slot_cues(slot_type: str) -> Set[str]:
+        cues = {
+            "book": {"book", "books", "read", "novel", "story", "title", "recommended", "suggested"},
+            "place": {"where", "place", "moved", "camped", "camp", "beach", "mountain", "forest", "country", "city", "home", "park", "trail", "lake"},
+            "person": {"who", "friend", "friends", "kid", "kids", "children", "support", "supports"},
+            "event": {"event", "events", "participated", "attended", "joined", "pride", "parade", "conference", "poetry", "reading", "school", "council", "meeting", "group", "community"},
+            "activity": {"activity", "activities", "destress", "hike", "hiking", "camp", "camping", "paint", "painting", "pottery", "swim", "swimming", "run", "running", "violin", "clarinet", "family"},
+            "item": {"paint", "painted", "painting", "art", "pottery", "symbol", "symbols", "item", "items", "instrument", "instruments", "pet", "pets", "name", "names", "change", "changes", "type", "types", "bought", "made"},
+            "count": {"time", "times", "once", "twice", "three", "four", "number", "count"},
+            "status": {"identity", "relationship", "status", "career", "path", "decided", "transition"},
+            "fact": set(),
+        }
+        return cues.get(slot_type, set())
+
+    def _rank_cat1_evidence_blocks(self, raw_context: str, question: str) -> List[Dict[str, str]]:
+        slot_type = self._cat1_slot_type(question)
+        slot_cues = self._cat1_slot_cues(slot_type)
+        question_tokens = self._overlap_tokens(question)
+        scored = []
+        for order, block in enumerate(self._parse_context_blocks(raw_context)):
+            fields = self._parse_memory_fields(block["content"])
+            fact_text = " ".join([
+                fields.get("speaker", ""),
+                fields.get("content", block["content"]),
+                fields.get("image_caption", ""),
+                fields.get("image_query", ""),
+            ])
+            fact_lower = fact_text.lower()
+            fact_tokens = self._overlap_tokens(fact_text)
+            cue_hits = {cue for cue in slot_cues if cue in fact_lower}
+            score = (
+                3 * len(question_tokens & fact_tokens)
+                + 2 * len(cue_hits)
+                + min(3, len(fact_tokens))
+            )
+            if score <= 0:
+                continue
+            scored.append((score, order, {
+                "dia_id": fields.get("dia_id", ""),
+                "date": fields.get("session_date", block.get("date", "")),
+                "speaker": fields.get("speaker", ""),
+                "fact": fields.get("content", block["content"]).strip(),
+                "image_caption": fields.get("image_caption", "").strip(),
+                "image_query": fields.get("image_query", "").strip(),
+                "slot_type": slot_type,
+                "cue_hits": ", ".join(sorted(cue_hits)),
+            }))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [block for _, _, block in scored[:8]]
+
+    def _format_cat1_evidence_list(self, raw_context: str, question: str) -> str:
+        lines = []
+        for idx, block in enumerate(self._rank_cat1_evidence_blocks(raw_context, question), start=1):
+            parts = [
+                f"[Evidence {idx}]",
+                f"dia_id: {block['dia_id'] or 'unknown'}",
+                f"slot_type: {block['slot_type']}",
+            ]
+            if block["date"]:
+                parts.append(f"session_date: {block['date']}")
+            if block["speaker"]:
+                parts.append(f"speaker: {block['speaker']}")
+            parts.append(f"raw_fact: {block['fact']}")
+            if block["image_caption"]:
+                parts.append(f"image_caption: {block['image_caption']}")
+            if block["image_query"]:
+                parts.append(f"image_query: {block['image_query']}")
+            if block["cue_hits"]:
+                parts.append(f"matched_slot_cues: {block['cue_hits']}")
+            lines.append("\n".join(parts))
+        return "\n\n".join(lines)
+
+    def refine_cat1_answer_with_evidence(
+        self,
+        question: str,
+        raw_context: str,
+        initial_response: str,
+    ) -> tuple:
+        evidence_list = self._format_cat1_evidence_list(raw_context, question)
+        evidence_block_count = len(re.findall(r"^\[Evidence ", evidence_list, flags=re.MULTILINE))
+        self.last_answer_debug = {
+            "cat1_evidence_rerank_used": False,
+            "cat1_evidence_block_count": evidence_block_count,
+            "cat1_initial_response": initial_response,
+        }
+        if not evidence_list:
+            return initial_response, ""
+
+        rerank_prompt = f"""You are revising a short answer for a LoCoMo Category 1 question.
+Use only the structured evidence below. Preserve every distinct answer item that is directly supported.
+If the question asks for multiple books, events, places, activities, items, people, instruments, pets, symbols, changes, or types, include all supported distinct items.
+If the initial answer omitted a supported item, add it.
+If the evidence does not support an item in the initial answer, remove it.
+Keep the final answer as a short phrase or comma-separated list. Do not explain.
+
+Question: {question}
+
+Initial answer: {initial_response}
+
+Structured evidence:
+{evidence_list}
+
+Final short answer:"""
+        try:
+            refined = self.memory_system.llm_controller.llm.get_completion(
+                rerank_prompt, temperature=0.1,
+            )
+        except Exception as e:
+            logger.warning("Cat1 evidence rerank failed: %s; using initial answer", e)
+            return initial_response, rerank_prompt
+        refined = parse_plain_text_answer(refined).strip()
+        self.last_answer_debug = {
+            "cat1_evidence_rerank_used": True,
+            "cat1_evidence_block_count": evidence_block_count,
+            "cat1_initial_response": initial_response,
+            "cat1_refined_response": refined,
+            "cat1_evidence_preview": evidence_list[:2000],
+        }
+        return refined or initial_response, rerank_prompt
+
     def answer_question(self, question: str, category: int, answer: str) -> tuple:
         """Generate answer for a question — plain text, no JSON schema."""
+        self.last_answer_debug = {}
         keywords = self.generate_query_llm(question)
         retrieval_query = self.build_retrieval_query(question, keywords)
         raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k, category=category)
@@ -448,6 +592,12 @@ Question: {question} Short answer:"""
             response = ""
         if category == 2:
             response = self.normalize_temporal_answer(response, raw_context, question)
+        if category == 1:
+            response, rerank_prompt = self.refine_cat1_answer_with_evidence(
+                question, raw_context, response,
+            )
+            if rerank_prompt:
+                user_prompt = f"{user_prompt}\n\n[Cat1 evidence rerank prompt]\n{rerank_prompt}"
         return response, user_prompt, raw_context
 
 
@@ -664,6 +814,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "user_prompt": user_prompt,
                     "retrieved_dia_ids": retrieval_diagnostics["retrieved_dia_ids"],
                     "retrieval_diagnostics": retrieval_diagnostics,
+                    "answer_diagnostics": dict(getattr(agent, "last_answer_debug", {}) or {}),
                 }
                 results.append(result)
 

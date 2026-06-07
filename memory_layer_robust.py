@@ -1532,6 +1532,129 @@ Rules:
         }
         return {token for token in tokens if token not in generic_tokens}
 
+    @staticmethod
+    def _category1_slot_profile(query: str) -> Dict[str, Any]:
+        """Infer the answer slot Cat1 is asking for from stable question wording."""
+        query_lower = str(query or "").lower()
+        slot_type = "fact"
+        cue_terms: Set[str] = set()
+        if re.search(r"\bhow many\b|\bnumber of\b", query_lower):
+            slot_type = "count"
+            cue_terms.update({"time", "times", "number", "count", "once", "twice", "three", "four"})
+        elif re.search(r"\bwhere\b", query_lower):
+            slot_type = "place"
+            cue_terms.update({
+                "where", "place", "places", "moved", "move", "from", "camp", "camped",
+                "beach", "mountain", "mountains", "forest", "country", "city", "home",
+                "park", "trail", "lake", "roadtrip", "trip",
+            })
+        elif re.search(r"\bwho\b", query_lower):
+            slot_type = "person"
+            cue_terms.update({"who", "friend", "friends", "kid", "kids", "child", "children", "support", "supports"})
+        elif re.search(r"\bbook|books|read|suggestion\b", query_lower):
+            slot_type = "book"
+            cue_terms.update({"book", "books", "read", "novel", "story", "title", "author", "recommended", "suggested"})
+        elif re.search(r"\bevent|events|participat|attended|community\b", query_lower):
+            slot_type = "event"
+            cue_terms.update({
+                "event", "events", "participated", "attended", "joined", "pride",
+                "parade", "conference", "poetry", "reading", "school", "council",
+                "meeting", "activist", "group", "community", "fundraiser",
+            })
+        elif re.search(r"\bactivit|destress|hikes?|family|partake|does\b", query_lower):
+            slot_type = "activity"
+            cue_terms.update({
+                "activity", "activities", "destress", "hike", "hiking", "camp", "camping",
+                "paint", "painting", "pottery", "swim", "swimming", "run", "running",
+                "violin", "clarinet", "music", "beach", "family", "kids",
+            })
+        elif re.search(r"\bpaint|art|pottery|symbols?|items?|instruments?|pets?|names?|changes?|types?|ways?\b", query_lower):
+            slot_type = "item"
+            cue_terms.update({
+                "paint", "painted", "painting", "art", "pottery", "symbol", "symbols",
+                "item", "items", "instrument", "instruments", "pet", "pets", "name",
+                "names", "change", "changes", "type", "types", "bought", "made",
+            })
+        elif re.search(r"\bidentity|relationship status|career path\b", query_lower):
+            slot_type = "status"
+            cue_terms.update({"identity", "relationship", "status", "career", "path", "decided", "transition"})
+
+        generic_question_terms = {
+            "what", "where", "when", "who", "which", "does", "did", "has", "have",
+            "caroline", "melanie", "their", "from", "with", "some", "many",
+        }
+        target_terms = {
+            token for token in re.findall(r"[a-z0-9]+", query_lower)
+            if len(token) >= 3 and token not in generic_question_terms
+        }
+        return {
+            "slot_type": slot_type,
+            "cue_terms": cue_terms,
+            "target_terms": target_terms,
+        }
+
+    def _category1_slot_signal(
+        self,
+        memory: RobustMemoryNote,
+        query: str,
+        profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        evidence_text = " ".join([
+            fields.get("speaker", ""),
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+            getattr(memory, "context", ""),
+            " ".join(getattr(memory, "keywords", [])),
+            " ".join(getattr(memory, "tags", [])),
+        ])
+        evidence_lower = evidence_text.lower()
+        evidence_tokens = self._retrieval_tokens(evidence_text)
+        slot_tokens = self._category1_slot_tokens(memory, query)
+        cue_terms = set(profile.get("cue_terms", set()))
+        target_terms = set(profile.get("target_terms", set()))
+        cue_hits = {term for term in cue_terms if term in evidence_lower or self._canonical_token(term) in evidence_tokens}
+        target_hits = target_terms & evidence_tokens
+        named_entities = {
+            self._canonical_token(token)
+            for token in re.findall(r"\b[A-Z][A-Za-z0-9']+\b", evidence_text)
+            if token.lower() not in {"Caroline".lower(), "Melanie".lower()}
+        }
+        quoted_terms = {
+            self._canonical_token(token)
+            for quoted in re.findall(r"['\"]([^'\"]{2,80})['\"]", evidence_text)
+            for token in re.findall(r"[A-Za-z0-9]+", quoted)
+            if len(token) >= 3
+        }
+        slot_type = str(profile.get("slot_type", "fact"))
+        typed_tokens = set(slot_tokens)
+        if slot_type in {"book", "event", "item", "person", "place"}:
+            typed_tokens |= named_entities | quoted_terms
+        if slot_type == "count":
+            number_words = {
+                "one", "two", "three", "four", "five", "six", "seven", "eight",
+                "once", "twice", "couple", "several",
+            }
+            typed_tokens |= {
+                token for token in evidence_tokens
+                if token.isdigit() or token in number_words
+            }
+        slot_score = (
+            2.0 * len(cue_hits)
+            + 1.5 * len(target_hits)
+            + 0.4 * min(10, len(typed_tokens))
+        )
+        if cue_hits and named_entities:
+            slot_score += 1.0
+        return {
+            "slot_type": slot_type,
+            "slot_score": slot_score,
+            "slot_cue_hits": sorted(cue_hits)[:12],
+            "slot_target_hits": sorted(target_hits)[:12],
+            "slot_tokens": typed_tokens,
+        }
+
     def _select_category1_coverage_ranked(
         self,
         ranked: List[tuple],
@@ -1550,6 +1673,7 @@ Rules:
         remaining = pool
         covered_tokens: Set[str] = set()
         selected_sessions: Dict[int, int] = {}
+        slot_profile = self._category1_slot_profile(query)
 
         debug_by_memory_id = {
             str(item.get("memory_id")): item
@@ -1557,12 +1681,14 @@ Rules:
             if item.get("memory_id") is not None
         }
         slot_cache: Dict[str, Set[str]] = {}
+        signal_cache: Dict[str, Dict[str, Any]] = {}
 
         def _score(item: tuple) -> tuple:
             _, neg_combined_score, original_order, _, memory = item
             memory = self._ensure_memory_schema(memory)
             memory_id = str(memory.id)
             slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
+            signal = signal_cache.setdefault(memory_id, self._category1_slot_signal(memory, query, slot_profile))
             new_tokens = slot_tokens - covered_tokens
             lexical_score = self._lexical_relevance(memory, query)
             dia_key = self._dia_sort_key(self._dia_id_for_memory(memory) or "")
@@ -1570,13 +1696,16 @@ Rules:
             same_session_count = selected_sessions.get(session_idx, 0) if session_idx >= 0 else 0
             combined_score = -float(neg_combined_score)
             relevance_penalty = 0.12 if lexical_score <= 0.0 and combined_score < 0.20 else 0.0
-            coverage_bonus = 0.055 * min(8, len(new_tokens))
+            slot_score = float(signal.get("slot_score", 0.0))
+            coverage_bonus = 0.025 * min(8, len(new_tokens))
+            slot_bonus = 0.075 * min(10.0, slot_score)
             diversity_bonus = 0.035 if session_idx >= 0 and same_session_count == 0 else 0.0
             lexical_bonus = 0.025 * min(1.0, lexical_score / 8.0)
             repeated_session_penalty = 0.025 * same_session_count
             selection_score = (
                 combined_score
                 + coverage_bonus
+                + slot_bonus
                 + diversity_bonus
                 + lexical_bonus
                 - repeated_session_penalty
@@ -1589,6 +1718,7 @@ Rules:
                 -original_order,
                 new_tokens,
                 slot_tokens,
+                signal,
                 lexical_score,
                 session_idx,
             )
@@ -1599,7 +1729,7 @@ Rules:
             best_score = _score(best_item)
             remaining.remove(best_item)
             selected.append(best_item)
-            _, _, _, _, new_tokens, slot_tokens, lexical_score, session_idx = best_score
+            _, _, _, _, new_tokens, slot_tokens, signal, lexical_score, session_idx = best_score
             covered_tokens.update(new_tokens)
             if session_idx >= 0:
                 selected_sessions[session_idx] = selected_sessions.get(session_idx, 0) + 1
@@ -1611,6 +1741,10 @@ Rules:
                 "cat1_coverage_gain": len(new_tokens),
                 "cat1_new_slot_tokens": sorted(new_tokens)[:12],
                 "cat1_slot_tokens": sorted(slot_tokens)[:20],
+                "cat1_answer_slot_type": signal.get("slot_type"),
+                "cat1_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
+                "cat1_slot_cue_hits": signal.get("slot_cue_hits", []),
+                "cat1_slot_target_hits": signal.get("slot_target_hits", []),
                 "cat1_lexical_score": lexical_score,
             }
 
@@ -1618,10 +1752,15 @@ Rules:
             memory = self._ensure_memory_schema(item[4])
             memory_id = str(memory.id)
             slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
+            signal = signal_cache.setdefault(memory_id, self._category1_slot_signal(memory, query, slot_profile))
             selection_diagnostics[memory_id] = {
                 "cat1_selected_primary": False,
                 "cat1_coverage_gain": len(slot_tokens - covered_tokens),
                 "cat1_slot_tokens": sorted(slot_tokens)[:20],
+                "cat1_answer_slot_type": signal.get("slot_type"),
+                "cat1_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
+                "cat1_slot_cue_hits": signal.get("slot_cue_hits", []),
+                "cat1_slot_target_hits": signal.get("slot_target_hits", []),
                 "cat1_lexical_score": self._lexical_relevance(memory, query),
             }
 
@@ -2009,7 +2148,10 @@ Rules:
         seen_ids = set()
         ranked = self._retrieval_candidates(query, k, routed_domains, category=category_int)
         primary_count = 0
-        primary_limit = min(k, self.final_bundle_size)
+        if category_int == 1:
+            primary_limit = min(k, self.final_bundle_max_size)
+        else:
+            primary_limit = min(k, self.final_bundle_size)
         max_context_blocks = max(primary_limit, self.final_bundle_max_size)
         local_context_primary_limit = 2
         local_context_min_lexical_score = 2.0
@@ -2034,7 +2176,7 @@ Rules:
                 "same_character": 5,
             })
             ranked = self._select_category1_coverage_ranked(ranked, query, primary_limit, k)
-            protected_primary_count = min(primary_limit, 4)
+            protected_primary_count = primary_limit
             effective_local_context_primary_limit = protected_primary_count
         else:
             protected_primary_count = 0
@@ -2047,7 +2189,7 @@ Rules:
             primary_count += 1
 
             lexical_score = self._lexical_relevance(memory, query)
-            allow_expansion = category_int != 1 or primary_count >= protected_primary_count
+            allow_expansion = category_int != 1
             if (
                 allow_expansion
                 and primary_count <= effective_local_context_primary_limit

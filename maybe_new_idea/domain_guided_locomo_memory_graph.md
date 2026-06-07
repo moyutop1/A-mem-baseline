@@ -860,3 +860,45 @@ Test whether the weak Cat1 F1 is mainly caused by candidate evidence being avail
 but not surviving into the final answer bundle. This patch should first be evaluated
 with --categories 1 only before adding evidence preservation or compression.
 ```
+
+Implemented Cat1 slot-aware answer patch:
+
+```text
+Scope: Category 1 only. Category 2 and Category 4 remain unchanged.
+Cache behavior: cache versions remain unchanged because this is query-time selection
+and answer-time reranking only.
+
+1. Replace broad Cat1 token coverage with answer-slot-aware coverage:
+   - Infer a stable slot type from question wording:
+     count, place, person, book, event, activity, item, status, or fact.
+   - Score candidates with slot cues and target-term hits in addition to base
+     retrieval score and weak token coverage.
+   - Add diagnostics:
+     cat1_answer_slot_type
+     cat1_answer_slot_score
+     cat1_slot_cue_hits
+     cat1_slot_target_hits
+
+2. Make Cat1 bundle construction primary-first:
+   - Use up to final_bundle_max_size primary candidates for Category 1.
+   - Disable local_context and graph expansion for Category 1 in this experiment.
+   - Purpose: isolate whether Cat1 failures are caused by evidence selection rather
+     than expansion noise.
+
+3. Add Cat1 evidence-preserving answer rerank:
+   - First generate the normal answer.
+   - Then build a structured evidence list from the raw retrieved context.
+   - Ask the model to revise the answer using only the structured evidence.
+   - Preserve every distinct supported item for list-style questions.
+   - Add answer_diagnostics with:
+     cat1_evidence_rerank_used
+     cat1_evidence_block_count
+     cat1_initial_response
+     cat1_refined_response
+     cat1_evidence_preview
+
+Expected effect:
+This should mainly help hit-but-wrong and candidate-hit-but-context-missed Cat1
+questions. It cannot solve questions where gold evidence is absent from the
+candidate pool.
+```
