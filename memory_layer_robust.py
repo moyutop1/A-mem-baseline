@@ -1512,6 +1512,131 @@ Rules:
         ]
         return ranked
 
+    def _category1_slot_tokens(self, memory: RobustMemoryNote, query: str) -> Set[str]:
+        """Tokens that can add complementary Cat1 evidence beyond the query wording."""
+        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        evidence_text = " ".join([
+            fields.get("content", getattr(memory, "current_content", memory.content)),
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+            getattr(memory, "context", ""),
+            " ".join(getattr(memory, "keywords", [])),
+            " ".join(getattr(memory, "tags", [])),
+        ])
+        query_tokens = self._retrieval_tokens(query)
+        tokens = self._retrieval_tokens(evidence_text) - query_tokens
+        generic_tokens = {
+            "thing", "things", "something", "someone", "people", "person", "memory",
+            "memories", "talk", "said", "tell", "asked", "shared", "discussed",
+            "session", "image", "photo", "picture", "caption", "query",
+        }
+        return {token for token in tokens if token not in generic_tokens}
+
+    def _select_category1_coverage_ranked(
+        self,
+        ranked: List[tuple],
+        query: str,
+        primary_limit: int,
+        k: int,
+    ) -> List[tuple]:
+        """Greedily front-load Cat1 candidates that cover different answer slots."""
+        if len(ranked) <= 1 or primary_limit <= 1:
+            return ranked
+
+        pool_size = min(len(ranked), max(k * 3, self.final_bundle_max_size * 3, primary_limit * 5))
+        pool = list(ranked[:pool_size])
+        tail = list(ranked[pool_size:])
+        selected: List[tuple] = []
+        remaining = pool
+        covered_tokens: Set[str] = set()
+        selected_sessions: Dict[int, int] = {}
+
+        debug_by_memory_id = {
+            str(item.get("memory_id")): item
+            for item in self.last_candidate_debug
+            if item.get("memory_id") is not None
+        }
+        slot_cache: Dict[str, Set[str]] = {}
+
+        def _score(item: tuple) -> tuple:
+            _, neg_combined_score, original_order, _, memory = item
+            memory = self._ensure_memory_schema(memory)
+            memory_id = str(memory.id)
+            slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
+            new_tokens = slot_tokens - covered_tokens
+            lexical_score = self._lexical_relevance(memory, query)
+            dia_key = self._dia_sort_key(self._dia_id_for_memory(memory) or "")
+            session_idx = dia_key[0] if dia_key else -1
+            same_session_count = selected_sessions.get(session_idx, 0) if session_idx >= 0 else 0
+            combined_score = -float(neg_combined_score)
+            relevance_penalty = 0.12 if lexical_score <= 0.0 and combined_score < 0.20 else 0.0
+            coverage_bonus = 0.055 * min(8, len(new_tokens))
+            diversity_bonus = 0.035 if session_idx >= 0 and same_session_count == 0 else 0.0
+            lexical_bonus = 0.025 * min(1.0, lexical_score / 8.0)
+            repeated_session_penalty = 0.025 * same_session_count
+            selection_score = (
+                combined_score
+                + coverage_bonus
+                + diversity_bonus
+                + lexical_bonus
+                - repeated_session_penalty
+                - relevance_penalty
+            )
+            return (
+                selection_score,
+                len(new_tokens),
+                combined_score,
+                -original_order,
+                new_tokens,
+                slot_tokens,
+                lexical_score,
+                session_idx,
+            )
+
+        selection_diagnostics: Dict[str, Dict[str, Any]] = {}
+        while remaining and len(selected) < primary_limit:
+            best_item = max(remaining, key=_score)
+            best_score = _score(best_item)
+            remaining.remove(best_item)
+            selected.append(best_item)
+            _, _, _, _, new_tokens, slot_tokens, lexical_score, session_idx = best_score
+            covered_tokens.update(new_tokens)
+            if session_idx >= 0:
+                selected_sessions[session_idx] = selected_sessions.get(session_idx, 0) + 1
+            memory = self._ensure_memory_schema(best_item[4])
+            selection_diagnostics[str(memory.id)] = {
+                "cat1_selected_primary": True,
+                "cat1_selected_rank": len(selected),
+                "cat1_selection_score": round(float(best_score[0]), 6),
+                "cat1_coverage_gain": len(new_tokens),
+                "cat1_new_slot_tokens": sorted(new_tokens)[:12],
+                "cat1_slot_tokens": sorted(slot_tokens)[:20],
+                "cat1_lexical_score": lexical_score,
+            }
+
+        for item in remaining:
+            memory = self._ensure_memory_schema(item[4])
+            memory_id = str(memory.id)
+            slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
+            selection_diagnostics[memory_id] = {
+                "cat1_selected_primary": False,
+                "cat1_coverage_gain": len(slot_tokens - covered_tokens),
+                "cat1_slot_tokens": sorted(slot_tokens)[:20],
+                "cat1_lexical_score": self._lexical_relevance(memory, query),
+            }
+
+        reordered = selected + remaining + tail
+        updated_debug = []
+        for _, _, _, _, memory in reordered[: max(k * 3, self.final_bundle_max_size)]:
+            debug = debug_by_memory_id.get(str(memory.id))
+            if not debug:
+                continue
+            debug.update(selection_diagnostics.get(str(memory.id), {}))
+            updated_debug.append(debug)
+        if updated_debug:
+            self.last_candidate_debug = updated_debug
+        return reordered
+
     def _memory_to_index_text(self, memory: RobustMemoryNote) -> str:
         """Build a weighted retriever document from the current valid memory object."""
         current_content = getattr(memory, "current_content", memory.content)
@@ -1900,6 +2025,20 @@ Rules:
             "same_topic": 7,
             "semantic_related": 8,
         }
+        if category_int == 1:
+            relation_priority.update({
+                "temporal_anchor": 0,
+                "supports": 1,
+                "derived_from": 2,
+                "similar_event": 4,
+                "same_character": 5,
+            })
+            ranked = self._select_category1_coverage_ranked(ranked, query, primary_limit, k)
+            protected_primary_count = min(primary_limit, 4)
+            effective_local_context_primary_limit = protected_primary_count
+        else:
+            protected_primary_count = 0
+            effective_local_context_primary_limit = local_context_primary_limit
         for _, _, _, i, memory in ranked:
             if memory.id in seen_ids:
                 continue
@@ -1908,7 +2047,12 @@ Rules:
             primary_count += 1
 
             lexical_score = self._lexical_relevance(memory, query)
-            if primary_count <= local_context_primary_limit and lexical_score >= local_context_min_lexical_score:
+            allow_expansion = category_int != 1 or primary_count >= protected_primary_count
+            if (
+                allow_expansion
+                and primary_count <= effective_local_context_primary_limit
+                and lexical_score >= local_context_min_lexical_score
+            ):
                 local_added = 0
                 for target_memory in self._local_context_neighbors(memory, dia_lookup, radius=1):
                     if (
@@ -1934,6 +2078,8 @@ Rules:
                     -float(edge.get("strength", 0.0)) if isinstance(edge, dict) else 0.0,
                 ),
             )
+            if not allow_expansion:
+                sorted_edges = []
             for edge in sorted_edges:
                 target_memory = self._edge_to_memory(edge, all_memories, id_to_memory)
                 relation = self._edge_relation(edge)
@@ -1960,7 +2106,8 @@ Rules:
                 seen_ids.add(target_memory.id)
                 memory_str += self._format_memory_for_context(target_memory, relation=relation)
                 neighbor_count += 1
-                if neighbor_count >= 2 or len(seen_ids) >= max_context_blocks:
+                neighbor_limit = 1 if category_int == 1 else 2
+                if neighbor_count >= neighbor_limit or len(seen_ids) >= max_context_blocks:
                     break
             if primary_count >= primary_limit or len(seen_ids) >= max_context_blocks:
                 break

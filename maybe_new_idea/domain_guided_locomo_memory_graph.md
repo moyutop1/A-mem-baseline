@@ -821,3 +821,42 @@ Determine whether failures come from candidate recall, final bundle selection, g
 expansion noise, or answer generation. This should be done before enabling more
 aggressive Cat1 slot coverage or evidence compression policies.
 ```
+
+Implemented Cat1 coverage bundle-selection patch:
+
+```text
+Scope: Category 1 only. Category 2 and Category 4 retrieval policies are unchanged.
+Cache behavior: retriever/domain graph cache versions are unchanged because this only
+reranks already-built candidates at query time.
+
+1. Add coverage-aware primary seed selection for Category 1:
+   - Extract slot tokens from each candidate memory content, image fields, context,
+     keywords, and tags.
+   - Remove tokens already present in the query.
+   - Greedily front-load candidates that add new slot tokens while retaining the
+     existing retrieval score as the base score.
+   - Add a small session-diversity bonus so multi-hop answers are less likely to be
+     collapsed into one local conversation segment.
+
+2. Protect primary evidence slots before graph expansion:
+   - For Category 1, the first up to four selected primary memories enter the bundle
+     before local/graph expansion can consume context budget.
+   - Category 1 graph expansion prefers temporal_anchor/supports/derived_from before
+     similar_event.
+   - Category 1 expansion is capped at one graph neighbor per primary after the
+     protected primary segment.
+
+3. Add diagnostics in candidate_debug:
+   - cat1_selected_primary
+   - cat1_selected_rank
+   - cat1_selection_score
+   - cat1_coverage_gain
+   - cat1_new_slot_tokens
+   - cat1_slot_tokens
+   - cat1_lexical_score
+
+Purpose:
+Test whether the weak Cat1 F1 is mainly caused by candidate evidence being available
+but not surviving into the final answer bundle. This patch should first be evaluated
+with --categories 1 only before adding evidence preservation or compression.
+```
