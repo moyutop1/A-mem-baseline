@@ -205,6 +205,44 @@ Keywords:"""
         return dia_ids
 
     @staticmethod
+    def _normalize_evidence_ids(evidence: List[str]) -> List[str]:
+        seen = set()
+        dia_ids = []
+        for item in evidence or []:
+            for dia_id in re.findall(r"D\d+:\d+", str(item)):
+                if dia_id not in seen:
+                    seen.add(dia_id)
+                    dia_ids.append(dia_id)
+        return dia_ids
+
+    @staticmethod
+    def _relation_counts(context: str) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for relation in re.findall(r"relation:\s*([a-zA-Z_]+)", context or ""):
+            counts[relation] = counts.get(relation, 0) + 1
+        return counts
+
+    def retrieval_diagnostics(self, raw_context: str, gold_evidence: List[str]) -> Dict[str, object]:
+        retrieved_dia_ids = self._extract_retrieved_dia_ids(raw_context)
+        retrieved_set = set(retrieved_dia_ids)
+        gold_evidence = self._normalize_evidence_ids(gold_evidence)
+        evidence_hit_any = bool(gold_evidence) and any(dia_id in retrieved_set for dia_id in gold_evidence)
+        evidence_hit_all = bool(gold_evidence) and all(dia_id in retrieved_set for dia_id in gold_evidence)
+        candidate_debug = getattr(self.memory_system, "last_candidate_debug", []) or []
+        return {
+            "gold_evidence": gold_evidence,
+            "retrieved_dia_ids": retrieved_dia_ids,
+            "evidence_hit_any": evidence_hit_any,
+            "evidence_hit_all": evidence_hit_all,
+            "missed_gold_evidence": [
+                dia_id for dia_id in gold_evidence if dia_id not in retrieved_set
+            ],
+            "relation_counts": self._relation_counts(raw_context),
+            "routed_domains": list(getattr(self.memory_system, "last_routed_domains", []) or []),
+            "candidate_debug": candidate_debug[:30],
+        }
+
+    @staticmethod
     def _overlap_tokens(text: str) -> Set[str]:
         stopwords = {
             "the", "and", "for", "with", "that", "this", "from", "into", "what", "when",
@@ -460,6 +498,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     all_categories = []
     total_questions = 0
     category_counts = defaultdict(int)
+    retrieval_diagnostic_counts = defaultdict(lambda: defaultdict(int))
 
     i = 0
     error_num = 0
@@ -601,6 +640,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
                 all_metrics.append(metrics)
                 all_categories.append(qa.category)
+                retrieval_diagnostics = agent.retrieval_diagnostics(raw_context, qa.evidence)
+                diag_category = str(qa.category)
+                retrieval_diagnostic_counts[diag_category]["total"] += 1
+                retrieval_diagnostic_counts[diag_category]["evidence_hit_any"] += int(
+                    bool(retrieval_diagnostics["evidence_hit_any"])
+                )
+                retrieval_diagnostic_counts[diag_category]["evidence_hit_all"] += int(
+                    bool(retrieval_diagnostics["evidence_hit_all"])
+                )
+                retrieval_diagnostic_counts[diag_category]["has_gold_evidence"] += int(
+                    bool(retrieval_diagnostics["gold_evidence"])
+                )
 
                 result = {
                     "sample_id": sample_idx,
@@ -611,7 +662,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "metrics": metrics,
                     "raw_context": raw_context,
                     "user_prompt": user_prompt,
-                    "retrieved_dia_ids": agent._extract_retrieved_dia_ids(raw_context),
+                    "retrieved_dia_ids": retrieval_diagnostics["retrieved_dia_ids"],
+                    "retrieval_diagnostics": retrieval_diagnostics,
                 }
                 results.append(result)
 
@@ -629,6 +681,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "total_questions": total_questions,
         "category_distribution": {
             str(cat): count for cat, count in category_counts.items()
+        },
+        "retrieval_diagnostics_summary": {
+            category: dict(counts)
+            for category, counts in retrieval_diagnostic_counts.items()
         },
         "aggregate_metrics": aggregate_results,
         "individual_results": results,

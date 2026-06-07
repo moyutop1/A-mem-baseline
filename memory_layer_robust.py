@@ -578,6 +578,7 @@ class RobustAgenticMemorySystem:
         self.final_bundle_max_size = max(self.final_bundle_size, int(final_bundle_max_size))
         self.offline_domain_tree: List[Dict[str, Any]] = []
         self.last_candidate_debug: List[Dict[str, Any]] = []
+        self.last_routed_domains: List[str] = []
         self.retrieval_index_version = RETRIEVAL_INDEX_VERSION
 
     @staticmethod
@@ -1837,6 +1838,7 @@ Rules:
 
         if route_domain and routed_domains is None:
             routed_domains = self.route_domains(query)
+        self.last_routed_domains = list(routed_domains or [])
         all_memories = list(self.memories.values())
         memory_str = ""
         ranked = self._retrieval_candidates(query, k, routed_domains, category=category)
@@ -1870,6 +1872,7 @@ Rules:
 
         if route_domain and routed_domains is None:
             routed_domains = self.route_domains(query)
+        self.last_routed_domains = list(routed_domains or [])
         try:
             category_int = int(category) if category is not None else None
         except (TypeError, ValueError):

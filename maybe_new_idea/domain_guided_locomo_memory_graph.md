@@ -796,3 +796,28 @@ Version: robust_retrieval_v5_source_aware_category_policy
 
 6. Bump retrieval and domain graph cache versions so old v4 caches are rebuilt.
 ```
+
+Implemented v6 diagnostics patch:
+
+```text
+Version behavior: retrieval policy unchanged from v5.
+
+1. Add per-question retrieval_diagnostics to result JSON:
+   - gold_evidence
+   - retrieved_dia_ids
+   - evidence_hit_any
+   - evidence_hit_all
+   - missed_gold_evidence
+   - relation_counts
+   - routed_domains
+   - candidate_debug
+
+2. Add top-level retrieval_diagnostics_summary by category.
+
+3. Store last routed domains in the memory layer so routing decisions can be inspected.
+
+Purpose:
+Determine whether failures come from candidate recall, final bundle selection, graph
+expansion noise, or answer generation. This should be done before enabling more
+aggressive Cat1 slot coverage or evidence compression policies.
+```
