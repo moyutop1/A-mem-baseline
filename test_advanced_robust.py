@@ -531,6 +531,62 @@ Final short answer:"""
         }
         return refined or initial_response, rerank_prompt
 
+    @staticmethod
+    def infer_answer_type(question: str) -> str:
+        """Infer answer format from question text only, not dataset category labels."""
+        question_lower = str(question or "").strip().lower()
+        if re.search(r"\bwhen\b|\bhow long ago\b|\bwhat date\b|\bwhich day\b", question_lower):
+            return "temporal"
+        if re.search(r"\bhow many\b|\bnumber of\b|\bhow often\b", question_lower):
+            return "count"
+        if re.search(r"\bpersonality traits?\b|\bpolitical leaning\b|\bfields? would\b|\bmore interested\b", question_lower):
+            return "trait_or_preference"
+        if re.search(r"\bwhat would\b.*\blikely be\b|\bwhat .* might\b", question_lower):
+            return "trait_or_preference"
+        if re.search(r"\bwould\b|\blikely\b|\bmight\b|\bconsidered\b", question_lower):
+            return "yes_no_judgment"
+        if re.search(
+            r"\bwhat (?:activities|events|books|items|types|ways|symbols|changes|musical artists|bands)\b"
+            r"|\bwhich (?:classical musicians|musical artists|bands)\b"
+            r"|\bin what ways\b",
+            question_lower,
+        ):
+            return "list"
+        if re.match(r"^(did|does|do|is|are|was|were|has|have|had|can|could)\b", question_lower):
+            return "yes_no_fact"
+        if re.search(r"\bwho\b", question_lower):
+            return "person"
+        if re.search(r"\bwhere\b|\bwhat country\b", question_lower):
+            return "place"
+        return "factual_span"
+
+    @staticmethod
+    def answer_type_instruction(answer_type: str) -> str:
+        instructions = {
+            "temporal": (
+                "Return only the date, relative date, duration, or approximate time. "
+                "Use the conversation date when resolving words like yesterday, last week, or next month."
+            ),
+            "count": "Return only the number or short count phrase.",
+            "yes_no_judgment": (
+                "Return only a short judgment such as Likely yes, Likely no, Yes, No, or a 2-4 word qualifier. "
+                "Do not explain with a full sentence."
+            ),
+            "trait_or_preference": (
+                "Return only the trait, field, preference, belief, or category phrase. "
+                "Do not include a reason."
+            ),
+            "list": (
+                "Return a comma-separated list of all distinct supported items. "
+                "Do not include unsupported items or explanations."
+            ),
+            "yes_no_fact": "Return only Yes or No, optionally followed by a 2-5 word factual qualifier.",
+            "person": "Return only the person or group names.",
+            "place": "Return only the place, country, or location phrase.",
+            "factual_span": "Return only the shortest factual answer phrase supported by the evidence.",
+        }
+        return instructions.get(answer_type, instructions["factual_span"])
+
     def answer_question(self, question: str, category: int, answer: str) -> tuple:
         """Generate answer for a question — plain text, no JSON schema."""
         self.last_answer_debug = {}
@@ -550,38 +606,36 @@ Final short answer:"""
 
         assert category in [1, 2, 3, 4, 5]
 
-        if category == 5:
-            answer_tmp = list()
-            if random.random() < 0.5:
-                answer_tmp.append('Not mentioned in the conversation')
-                answer_tmp.append(answer)
-            else:
-                answer_tmp.append(answer)
-                answer_tmp.append('Not mentioned in the conversation')
-            user_prompt = f"""Based on the context: {context}, answer the following question. {evidence_instruction} {question}
+        answer_type = self.infer_answer_type(question)
+        format_instruction = self.answer_type_instruction(answer_type)
+        self.last_answer_debug = {
+            "question_type_answer_planner": True,
+            "answer_type": answer_type,
+            "format_instruction": format_instruction,
+        }
+        user_prompt = f"""Based on the context, answer the question using only supported evidence.
+{evidence_instruction}
 
-Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}  Short answer:"""
-            temperature = self.temperature_c5
-        elif category == 2:
-            user_prompt = f"""Based on the context: {context}, answer the following question. {evidence_instruction} Use DATE of CONVERSATION to answer with an approximate date.
-Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.
+Answer type inferred from the question: {answer_type}
+Format requirement: {format_instruction}
 
-Question: {question} Short answer:"""
-            temperature = 0.7
-        elif category == 3:
-            user_prompt = f"""Based on the context: {context}, answer the following inference question. {evidence_instruction}
-Category 3 questions often require a brief judgment, likely preference, trait, field, belief, or other inference from the evidence.
-Give a concise answer that best matches the implied meaning. When the question asks for a likely yes/no judgment, answer with "Likely yes/no; brief reason" if the evidence supports a reason.
-When the answer is a named holiday, book, place, person, or other proper term found in the context, preserve the wording from the context.
-For traits, preferences, likely fields, beliefs, or status, include 2-4 words or a very short reason rather than a bare yes/no.
+General rules:
+- Prefer exact words from the conversation whenever possible.
+- Keep the answer as short as possible.
+- Do not explain or cite evidence.
+- Only answer "Not mentioned in the conversation" if the context truly lacks supporting evidence.
 
-Question: {question} Short answer:"""
+Context:
+{context}
+
+Question: {question}
+Short answer:"""
+        if answer_type in {"yes_no_judgment", "trait_or_preference", "yes_no_fact"}:
+            temperature = 0.2
+        elif answer_type == "temporal":
             temperature = 0.3
         else:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. {evidence_instruction} Answer with exact words from the context whenever possible.
-
-Question: {question} Short answer:"""
-            temperature = 0.7
+            temperature = 0.3
 
         try:
             response = self.memory_system.llm_controller.llm.get_completion(
@@ -590,7 +644,7 @@ Question: {question} Short answer:"""
         except Exception as e:
             logger.warning("answer_question failed: %s — returning empty", e)
             response = ""
-        if category == 2:
+        if answer_type == "temporal":
             response = self.normalize_temporal_answer(response, raw_context, question)
         if category == 1:
             response, rerank_prompt = self.refine_cat1_answer_with_evidence(
@@ -598,6 +652,11 @@ Question: {question} Short answer:"""
             )
             if rerank_prompt:
                 user_prompt = f"{user_prompt}\n\n[Cat1 evidence rerank prompt]\n{rerank_prompt}"
+            self.last_answer_debug.update({
+                "question_type_answer_planner": True,
+                "answer_type": answer_type,
+                "format_instruction": format_instruction,
+            })
         return response, user_prompt, raw_context
 
 
