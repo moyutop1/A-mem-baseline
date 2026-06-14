@@ -569,12 +569,12 @@ Final short answer:"""
             ),
             "count": "Return only the number or short count phrase.",
             "yes_no_judgment": (
-                "Return only a short judgment such as Likely yes, Likely no, Yes, No, or a 2-4 word qualifier. "
-                "Do not explain with a full sentence."
+                "Return Likely yes or Likely no, followed by a very short evidence phrase when available. "
+                "Example style: Likely yes; classic children's books. Do not write a full explanation."
             ),
             "trait_or_preference": (
-                "Return only the trait, field, preference, belief, or category phrase. "
-                "Do not include a reason."
+                "Return the trait, field, preference, belief, or category phrase, optionally followed by a very short evidence anchor. "
+                "Do not write a full explanation."
             ),
             "list": (
                 "Return a comma-separated list of all distinct supported items. "
@@ -583,7 +583,10 @@ Final short answer:"""
             "yes_no_fact": "Return only Yes or No, optionally followed by a 2-5 word factual qualifier.",
             "person": "Return only the person or group names.",
             "place": "Return only the place, country, or location phrase.",
-            "factual_span": "Return only the shortest factual answer phrase supported by the evidence.",
+            "factual_span": (
+                "Return the shortest factual answer phrase supported by the evidence. "
+                "If a relevant memory mentions the subject, object, event, or activity asked about, answer with the closest supported phrase."
+            ),
         }
         return instructions.get(answer_type, instructions["factual_span"])
 
@@ -622,8 +625,10 @@ Format requirement: {format_instruction}
 General rules:
 - Prefer exact words from the conversation whenever possible.
 - Keep the answer as short as possible.
-- Do not explain or cite evidence.
-- Only answer "Not mentioned in the conversation" if the context truly lacks supporting evidence.
+- Do not cite memory IDs or write a long explanation.
+- If the context mentions the relevant person, object, event, or activity asked about, answer with the closest supported phrase.
+- Do not answer "Not mentioned in the conversation" merely because the wording is indirect.
+- Only answer "Not mentioned in the conversation" when no retrieved memory block mentions the subject or event needed to answer.
 
 Context:
 {context}
