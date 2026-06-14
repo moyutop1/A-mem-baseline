@@ -1,0 +1,1393 @@
+# A-Mem LoCoMo Modification Plan: Innovation Points and System Flow
+
+## 0. Goal
+
+This document summarizes the planned A-Mem modification for LoCoMo-style precise episodic QA.
+
+The current priority is to improve evidence recall and reduce noisy memory interference. The system should preserve raw episodic evidence, retrieve a small and accurate memory bundle, and use bundle-level reflection to update retrieval behavior.
+
+We focus on five innovation points:
+
+1. Evidence-preserving Episodic Memory Writer
+2. Episodic Memory Graph Retrieval
+3. Soft Domain Rerank + Hybrid Evidence Retrieval
+4. Memory-bundle-level Reflection
+5. Memory Life-cycle Utility Management
+
+Temporal normalization is not an independent innovation point. It is treated as a supporting component inside graph retrieval and reranking.
+
+---
+
+## 1. Problem Diagnosis
+
+Early LoCoMo experiments show that the main failure is evidence retrieval, not only answer generation.
+
+Example:
+
+```text
+Q: What did Caroline research?
+Predicted: Caroline did not research anything.
+Gold: Adoption agencies
+Gold evidence: Researching adoption agencies...
+```
+
+This suggests that the gold evidence did not enter the final context, or it was overwhelmed by irrelevant retrieved memories.
+
+Another failure type is temporal QA:
+
+```text
+Q: When did Caroline go to the LGBTQ support group?
+Predicted: last Tues
+Gold: 7 May 2023
+Evidence: In an 8 May 2023 session, the dialogue says "yesterday".
+```
+
+This requires explicit temporal normalization:
+
+```text
+8 May 2023 + yesterday = 7 May 2023
+```
+
+Top-k retrieval also introduces noise. Increasing k may retrieve semantically similar but incorrect memories, such as book/education-related memories that distract from the correct answer "psychology, counseling certification".
+
+---
+
+## 2. Innovation A: Evidence-preserving Episodic Memory Writer
+
+### Core Idea
+
+For LoCoMo, each raw dialogue turn should be stored as an immutable instance-level evidence memory.
+
+Do not aggressively rewrite, merge, or summarize raw episodic turns.
+
+### Required Memory Fields
+
+Each LoCoMo memory node should include:
+
+```yaml
+memory_id: locomo_D2_8
+conversation_id: conv_001
+dia_id: D2:8
+session_id: D2
+turn_id: 8
+session_date: 2023-05-25
+speaker: Caroline
+content: "Researching adoption agencies..."
+raw_text: "Caroline: Researching adoption agencies..."
+memory_level: instance
+rewrite_allowed: false
+status: active_evidence
+entities:
+  - Caroline
+  - adoption agencies
+temporal_expressions: []
+```
+
+For temporal memories:
+
+```yaml
+memory_id: locomo_D3_12
+dia_id: D3:12
+session_date: 2023-05-08
+speaker: Caroline
+content: "I went to the LGBTQ support group yesterday."
+raw_text: "Caroline: I went to the LGBTQ support group yesterday."
+memory_level: instance
+rewrite_allowed: false
+status: active_evidence
+entities:
+  - Caroline
+  - LGBTQ support group
+temporal_expressions:
+  - text: yesterday
+    anchor: session_date
+    normalized_date: 2023-05-07
+```
+
+### Rule
+
+```python
+if dataset == "LoCoMo" and memory_level == "instance":
+    create_separate_memory()
+    rewrite_allowed = False
+    allow_link = True
+```
+
+Raw LoCoMo instance memories should not be rewritten. They can only be linked, retrieved, grounded, or used as evidence.
+
+---
+
+## 3. Innovation B: Episodic Memory Graph Retrieval
+
+### Core Idea
+
+Do not retrieve memories as isolated top-k text chunks. Instead, treat raw dialogue turns as evidence nodes in an episodic memory graph.
+
+The graph should help retrieve local context, same-event evidence, speaker-aligned memories, entity-aligned memories, and temporal anchors.
+
+### Disallowed Edge Types
+
+The following edge types should not exist as persistent graph edges:
+
+```text
+updates
+replaces
+conflicts_with
+```
+
+Updates and conflicts should be resolved through memory writing or reflection procedures, not graph traversal.
+
+### Allowed Edge Types
+
+#### 1. `adjacent_turn`
+
+Connect nearby turns in the same session.
+
+```text
+D2:7 <-> D2:8
+D2:8 <-> D2:9
+```
+
+Purpose: local context expansion.
+
+#### 2. `same_session`
+
+Memories from the same session.
+
+Purpose: weak bonus or candidate pool. Do not expand the entire session into the final context.
+
+#### 3. `same_speaker`
+
+Memories from the same speaker.
+
+Purpose: query-time speaker bonus. Do not globally expand all same-speaker memories.
+
+#### 4. `mentions_same_entity`
+
+Connect memories that mention the same entity, object, activity, or noun phrase.
+
+Examples:
+
+```text
+adoption agencies
+LGBTQ support group
+psychology
+counseling certification
+```
+
+#### 5. `same_event`
+
+Connect nearby memories that likely describe the same event.
+
+A simple first-version rule:
+
+```python
+if same_session(i, j) and abs(turn_i - turn_j) <= 3:
+    if shared_entity(i, j) or high_lexical_overlap(i, j):
+        add_edge(i, j, "same_event", weight=0.8)
+```
+
+#### 6. `temporal_anchor`
+
+A memory contains a relative temporal expression linked to the session date.
+
+This can be stored as metadata rather than a persistent edge:
+
+```yaml
+temporal_expressions:
+  - text: yesterday
+    anchor: 2023-05-08
+    normalized_date: 2023-05-07
+```
+
+#### 7. `evidence_supports_summary`
+
+If a derived or summary memory exists, it must be grounded in raw evidence memories.
+
+```text
+raw_instance_memory -> summary_memory
+```
+
+### Edge Storage
+
+Use an independent edge table or graph store.
+
+```sql
+CREATE TABLE memory_edges (
+    edge_id TEXT PRIMARY KEY,
+    src TEXT,
+    dst TEXT,
+    edge_type TEXT,
+    weight REAL,
+    metadata_json TEXT
+);
+```
+
+Example:
+
+```json
+{
+  "edge_id": "edge_0001",
+  "src": "locomo_D2_8",
+  "dst": "locomo_D2_9",
+  "edge_type": "adjacent_turn",
+  "weight": 1.0,
+  "metadata": {
+    "distance": 1,
+    "direction": "next"
+  }
+}
+```
+
+### Graph Retrieval Flow
+
+```text
+query
+  ↓
+question type classification
+  ↓
+hybrid seed retrieval
+  ↓
+question-type-specific edge expansion
+  ↓
+evidence-focused reranking
+  ↓
+small role-labeled memory bundle
+```
+
+Question types may include:
+
+```text
+factual_action
+temporal
+preference_or_likely
+relationship_identity
+summary
+```
+
+Example edge policy:
+
+```python
+edge_policy = {
+    "factual_action": ["adjacent_turn", "mentions_same_entity"],
+    "temporal": ["same_event", "adjacent_turn", "mentions_same_entity"],
+    "preference_or_likely": ["mentions_same_entity", "same_speaker", "same_event"],
+    "relationship_identity": ["mentions_same_entity", "adjacent_turn", "same_session"],
+}
+```
+
+Limit graph expansion. Retrieve many candidates, but select only a small final bundle.
+
+Suggested first-version limits:
+
+```yaml
+seed_top_k: 20
+graph_expand_per_seed: 2
+final_context_budget: 4-6
+max_adjacent_turns: 2
+```
+
+---
+
+## 4. Innovation C: Soft Domain Rerank + Hybrid Evidence Retrieval
+
+### Core Idea
+
+Domain routing should not be a hard filter.
+
+Wrong domain routing can block gold evidence. Therefore, domain information should be used only as a soft reranking bonus.
+
+### Scoring
+
+A simple first-version score:
+
+```text
+score(m) =
+  embedding_score(q, m)
++ BM25_score(q, m)
++ speaker_entity_score(q, m)
++ edge_score(q, m)
++ temporal_score(q, m)
++ domain_bonus(q, m)
+- noise_penalty(q, m)
+```
+
+Domain bonus should only increase score. It should not remove non-matching memories.
+
+A lightweight version:
+
+```text
+score(m) = s_embed(q, m) + 0.15 * I(domain_match) - 0.20 * lifecycle_penalty(m)
+```
+
+### Hybrid Candidate Retrieval
+
+Use multiple candidate sources:
+
+```python
+candidates = []
+candidates += embedding_retrieve(query, all_memories, top_k=20)
+candidates += bm25_retrieve(query, all_memories, top_k=20)
+candidates += speaker_entity_retrieve(query, all_memories, top_k=20)
+
+if is_temporal_question(query):
+    candidates += temporal_retrieve(query, all_memories, top_k=10)
+
+if domain_router_confident:
+    candidates += domain_biased_retrieve(query, top_domains, top_k=10)
+
+candidates = deduplicate(candidates)
+ranked = evidence_rerank(candidates)
+final_bundle = select_top_evidence_bundle(ranked, budget=4_to_6)
+```
+
+### Principle
+
+```text
+retrieve many candidates, select few evidence memories
+```
+
+Do not simply increase final top-k. Larger top-k can increase noise and reduce answer accuracy.
+
+---
+
+## 5. Innovation D: Memory-bundle-level Reflection
+
+### Core Idea
+
+Reflection should not only ask whether each single memory was useful. It should evaluate whether the retrieved memory bundle as a whole helped reasoning.
+
+The system should diagnose whether the bundle contained:
+
+```text
+missing evidence
+noisy memories
+redundant memories
+stale or outdated memories
+conflicting memories
+ungrounded summaries
+inconsistency between derived memories and raw instance evidence
+memories repeatedly retrieved but rarely helpful
+```
+
+### Reflection Flow
+
+```text
+query
+  ↓
+retrieve memory bundle
+  ↓
+agent uses memory bundle
+  ↓
+execution / response feedback
+  ↓
+bundle-level reflection
+  ↓
+update memory states, retrieval weights, graph edge weights, and grounding links
+```
+
+### Edit Actions
+
+The reflection module should output structured edit actions.
+
+#### ADD
+
+Necessary evidence is missing.
+
+Actions:
+
+```text
+trigger supplementary retrieval
+log missed evidence
+create new memory only if evidence is absent from the memory store
+```
+
+#### PRUNE
+
+A memory was retrieved but did not help or introduced noise.
+
+Actions:
+
+```text
+lower retrieval weight for this memory under the current question type / query pattern
+do not delete raw evidence memory
+```
+
+#### SUBSTITUTE
+
+A broad or noisy memory should be replaced by a more precise evidence memory.
+
+Example:
+
+```text
+replace summary memory with raw instance evidence
+```
+
+#### MERGE
+
+Multiple related instance memories can support a derived memory.
+
+Important constraint:
+
+```text
+do not physically merge or delete raw instance memories
+create a derived memory and preserve evidence links
+```
+
+#### SPLIT
+
+A mixed or overly broad derived memory should be split into cleaner memory notes.
+
+Mostly applies to:
+
+```text
+summary memory
+generated memory
+badly constructed memory note
+```
+
+Not usually raw LoCoMo turns.
+
+#### CONTRADICT
+
+The bundle contains inconsistency.
+
+Important constraint:
+
+```text
+CONTRADICT is a reflection action, not a persistent graph edge.
+```
+
+For raw instance memories, do not overwrite or delete them. For derived memories, trigger resolution, rewriting, or grounding correction.
+
+#### ABSTRACT
+
+Create a generalized memory from multiple raw evidence memories.
+
+Constraint:
+
+```text
+ABSTRACT must preserve supporting evidence links.
+```
+
+#### GROUND
+
+A summary or generalized memory must be linked to supporting raw evidence.
+
+If no supporting evidence exists:
+
+```text
+status = ungrounded_summary
+retrieval_weight = low
+```
+
+### Reflection Output Format
+
+Example:
+
+```json
+{
+  "bundle_helpfulness": "insufficient",
+  "diagnosis": [
+    {
+      "issue": "missing_evidence",
+      "description": "The bundle did not include the memory where Caroline said she was researching adoption agencies."
+    },
+    {
+      "issue": "retrieval_noise",
+      "description": "Retrieved memories about school/books are semantically related but do not answer the research question."
+    }
+  ],
+  "edit_actions": [
+    {
+      "action": "ADD",
+      "target": "locomo_D2_8",
+      "reason": "Gold evidence should be retrieved for factual_action questions involving Caroline and research."
+    },
+    {
+      "action": "PRUNE",
+      "target": "locomo_D4_2",
+      "scope": {
+        "question_type": "factual_action",
+        "query_terms": ["research"]
+      },
+      "reason": "This memory was retrieved but did not contribute to the answer."
+    }
+  ],
+  "retrieval_policy_update": {
+    "increase": ["BM25", "speaker_match", "lexical_trigger"],
+    "decrease": ["broad_semantic_related", "same_session"]
+  }
+}
+```
+
+---
+
+## 6. Innovation E: Memory Life-cycle Utility Management
+
+### Core Idea
+
+Memory retrieval should not treat every stored memory as equally useful forever.
+
+Each raw evidence memory should maintain life-cycle utility statistics from retrieval and answer feedback. Memories that are repeatedly retrieved and repeatedly help produce correct answers should receive a positive rerank bonus. Memories that are often retrieved but rarely help, introduce noise, or lead to wrong answers should receive a penalty under similar query types.
+
+This innovation is not a memory rewriting mechanism. It is a retrieval policy adaptation mechanism.
+
+The key idea is broader than "frequently retrieved memories become more important".
+Retrieval frequency alone is not a reliable utility signal. A memory should become more important only when it is repeatedly useful under a specific query condition, and it should become less important when it is repeatedly retrieved as noise.
+
+Therefore, life-cycle management should model memory utility as a multi-dimensional retrieval history:
+
+```text
+memory utility
+  = usefulness for this question type
+  + usefulness for this domain / entity / storyline
+  + grounding reliability
+  + recency / freshness when relevant
+  - noise history
+  - redundancy with stronger evidence
+  - stale or ungrounded summary penalty
+```
+
+This module is intended to be a later-stage innovation after evidence recall becomes acceptable. If early retrieval is unstable, life-cycle feedback can reinforce retrieval mistakes.
+
+### Motivation
+
+In LoCoMo-style long conversations, many memories are semantically related to a question but are not useful evidence for answering it.
+
+Example:
+
+```text
+Question: What did Caroline research?
+Useful evidence: adoption agencies
+Noisy evidence: books, school, general identity discussion
+```
+
+If a noisy memory is repeatedly retrieved for research-related questions and repeatedly fails to support the correct answer, the system should learn to reduce its retrieval priority for that query pattern.
+
+Similarly, if a memory such as `D2:8` repeatedly supports correct answers about Caroline researching adoption agencies, it should become easier to retrieve for future similar questions.
+
+### Required Life-cycle Fields
+
+Each memory should maintain lightweight feedback statistics:
+
+```yaml
+retrieval_count: 0
+citation_count: 0
+successful_citation_count: 0
+failed_citation_count: 0
+noise_count: 0
+missed_when_gold_count: 0
+last_retrieved_at: null
+last_successful_at: null
+life_cycle_status: active
+utility_by_question_type:
+  factual_action:
+    successful: 0
+    failed: 0
+  temporal:
+    successful: 0
+    failed: 0
+  multi_evidence_list:
+    successful: 0
+    failed: 0
+utility_by_domain:
+  "Personal Life / Identity":
+    successful: 0
+    failed: 0
+utility_by_entity:
+  Caroline:
+    successful: 0
+    failed: 0
+utility_by_storyline:
+  "Caroline LGBTQ participation":
+    successful: 0
+    failed: 0
+redundancy_count: 0
+stale_count: 0
+grounding_success_count: 0
+grounding_failure_count: 0
+exploration_count: 0
+```
+
+Raw LoCoMo memories remain immutable evidence nodes. Life-cycle management updates metadata and retrieval weights only.
+
+### Confirmed First-version Design
+
+The first implementation should use the following simplified design.
+
+```text
+1. Use a global utility score for each memory.
+2. Share this utility across the current memory tree / domain tree.
+3. Update life-cycle statistics after every answered question.
+4. Use an LLM judge to classify each retrieved memory as useful, partially useful, redundant, noisy, irrelevant, or misleading.
+5. If the answer is wrong, penalize only memories judged noisy, irrelevant, or misleading.
+6. Do not penalize redundant memories; record redundancy_count only.
+7. Use gold evidence dia_ids only for research diagnostics and evaluation analysis, not as a required signal in the general system.
+```
+
+This keeps the first version simple and avoids prematurely adding question-type-specific utility before retrieval behavior is stable.
+
+### Multi-dimensional Utility Score
+
+A first-version Bayesian utility estimate:
+
+```text
+utility(m) =
+  (successful_citation_count + alpha)
+  /
+  (successful_citation_count + failed_citation_count + alpha + beta)
+```
+
+Suggested default:
+
+```text
+alpha = 1
+beta = 1
+```
+
+This avoids over-trusting memories after only one successful retrieval.
+
+The first-version rerank score can include:
+
+```text
+score(m, q) =
+  evidence_relevance(m, q)
++ domain_bonus(m, q)
++ graph_bonus(m, q)
++ lambda_utility * global_utility(m)
+- lambda_noise * global_noise_penalty(m)
+- lifecycle_penalty(m)
+```
+
+For a stronger later version, utility can become scoped rather than global:
+
+```text
+utility(m, q) =
+  w_global * global_utility(m)
++ w_type * utility_by_question_type(m, type(q))
++ w_domain * utility_by_domain(m, routed_or_predicted_domain(q))
++ w_entity * utility_by_entity(m, entities(q))
++ w_story * utility_by_storyline(m, storyline(q))
++ w_ground * grounding_reliability(m)
+- w_noise * noise_rate(m, type(q))
+- w_redundant * redundancy_penalty(m, current_bundle)
+```
+
+Scoped utility can prevent a memory from becoming globally over-promoted just because it helped one narrow question type. This is a later extension, not the first implementation.
+
+### Additional Life-cycle Signals
+
+The following signals can make this module more substantial than a single success-count feature.
+
+#### 1. Query-type-scoped utility
+
+The same memory may be useful for temporal questions but noisy for list-style questions.
+
+Example:
+
+```text
+D5:1 pride parade
+Useful for: LGBTQ event questions
+Possibly noisy for: generic identity questions
+```
+
+First-version decision:
+
+```text
+Do not implement this yet. Start with global utility.
+```
+
+#### 2. Domain/entity/storyline utility
+
+Track whether a memory is useful for a specific domain, entity, or storyline.
+
+Example:
+
+```text
+Storyline: Caroline LGBTQ participation
+Useful memories: support group, school speech, pride parade, mentorship, art show
+```
+
+This can later interact with graph expansion. High-utility memories can become stronger seeds for the corresponding storyline.
+
+First-version decision:
+
+```text
+Do not implement scoped domain/entity/storyline utility yet. Keep these fields as future extensions.
+```
+
+#### 3. Grounding reliability
+
+Derived or summary memories should receive utility only if they are consistently grounded in raw evidence.
+
+Raw LoCoMo turn memories start with high grounding reliability because they are direct evidence. Generated summaries must earn grounding reliability through supporting evidence links.
+
+#### 4. Noise and redundancy tracking
+
+A memory should be penalized if it is often retrieved but does not contribute to the final answer.
+
+Redundancy should be treated separately from noise:
+
+```text
+noise: irrelevant or misleading evidence
+redundancy: relevant but adds no new answer slot beyond stronger evidence
+```
+
+This matters for bundle selection. A relevant but redundant memory should not be deleted or globally penalized; it should simply lose priority when the current bundle already contains equivalent evidence.
+
+First-version decision:
+
+```text
+Noise is judged by an LLM after each answer.
+Penalize only memories judged noisy, irrelevant, or misleading.
+Redundant memories are not penalized globally; only record redundancy_count.
+```
+
+#### 5. Freshness and staleness
+
+Some memories become stale when newer evidence changes the user's state, plan, or preference.
+
+For LoCoMo raw evidence, the old memory should remain preserved, but retrieval should prefer the newer memory when the question asks about current status.
+
+Example:
+
+```text
+Older memory: considering a plan
+Newer memory: decided on a plan
+Current-status question: prefer newer evidence
+Historical question: keep older evidence retrievable
+```
+
+#### 6. Exploration vs exploitation
+
+If the system always boosts previously successful memories, it may overfit early feedback and repeatedly retrieve the same popular evidence.
+
+Use a small exploration mechanism:
+
+```text
+mostly retrieve high-utility memories
+occasionally allow uncertain but relevant memories into the candidate pool
+```
+
+This is especially important before the system has enough feedback.
+
+### Positive Feedback
+
+Increase utility when:
+
+```text
+1. The memory appears in the final evidence bundle.
+2. The LLM judge marks the memory as useful or directly supporting.
+3. The final answer is correct or has high F1.
+4. During research evaluation, the memory's dia_id overlaps with gold evidence.
+```
+
+Gold evidence dia_id overlap is an evaluation shortcut, not a required signal for real deployment.
+
+### Negative Feedback
+
+Decrease utility when:
+
+```text
+1. The final answer is wrong or low-quality.
+2. The LLM judge marks the retrieved memory as noisy, irrelevant, or misleading.
+3. The memory repeatedly appears in wrong-answer bundles as judged noise.
+4. The memory repeatedly displaces stronger evidence under similar query patterns.
+```
+
+Do not penalize every memory in a wrong-answer bundle. Some retrieved memories may be correct gold evidence, and the failure may come from answer extraction rather than retrieval.
+
+### Life-cycle Status
+
+Possible statuses:
+
+```text
+active
+high_utility
+low_utility
+noisy_for_query_type
+stale
+needs_grounding
+```
+
+Important constraint:
+
+```text
+status affects retrieval priority only.
+It must not delete or rewrite raw LoCoMo evidence memories.
+```
+
+### Relationship to Bundle Reflection
+
+Bundle-level reflection produces the feedback signal. Life-cycle management stores and applies the signal.
+
+```text
+retrieved bundle
+  -> answer
+  -> evaluation / reflection
+  -> identify useful, missing, noisy, redundant memories
+  -> update memory utility statistics
+  -> future rerank uses learned utility
+```
+
+Life-cycle updates should be applied after bundle-level diagnosis, not directly from final answer correctness alone.
+
+First-version update timing:
+
+```text
+After every answered question:
+  1. evaluate answer quality
+  2. ask LLM to judge each retrieved memory's role
+  3. update global utility / noise / redundancy statistics
+  4. immediately use updated utility for the next question
+```
+
+Example:
+
+```text
+Wrong answer + retrieved memory is actually gold evidence:
+  do not penalize the memory
+  diagnose answer extraction failure
+
+Wrong answer + retrieved memory is unrelated:
+  penalize the memory for the current question type / query pattern
+
+Correct answer + memory overlaps gold evidence:
+  increase global utility
+
+Correct answer + memory was retrieved but unused:
+  do not increase utility
+  possibly mark as redundant
+```
+
+### LLM Judge Output for Life-cycle Updates
+
+The LLM judge should classify each retrieved memory after an answer.
+
+Example output:
+
+```json
+{
+  "answer_quality": "incorrect",
+  "memory_judgments": [
+    {
+      "dia_id": "D2:8",
+      "role": "useful",
+      "reason": "This memory directly states that Caroline researched adoption agencies.",
+      "utility_update": "increase"
+    },
+    {
+      "dia_id": "D8:37",
+      "role": "noisy",
+      "reason": "This memory discusses a book and distracts from the adoption-agency answer.",
+      "utility_update": "decrease"
+    },
+    {
+      "dia_id": "D8:38",
+      "role": "redundant",
+      "reason": "This memory is related to the same broad topic but adds no new answer evidence.",
+      "utility_update": "none"
+    }
+  ]
+}
+```
+
+Allowed memory roles:
+
+```text
+useful
+partially_useful
+redundant
+noisy
+irrelevant
+misleading
+```
+
+Update policy:
+
+```text
+useful / partially_useful + correct answer:
+  increase successful_citation_count
+
+noisy / irrelevant / misleading + wrong answer:
+  increase failed_citation_count and noise_count
+
+redundant:
+  increase redundancy_count only
+```
+
+### Evaluation for Life-cycle Management
+
+This innovation should be evaluated beyond final QA F1.
+
+Suggested metrics:
+
+```text
+Utility-weighted Evidence Recall
+Noise Memory Retrieval Rate
+Repeated-noise Suppression Rate
+Gold Evidence Promotion Rate
+High-utility Memory Precision
+Low-utility Memory Suppression Accuracy
+Answerable Context Rate before/after utility updates
+Performance over repeated evaluation rounds
+```
+
+Suggested ablation:
+
+```text
+without life-cycle utility
+global utility only
+question-type-scoped utility
+domain/entity/storyline-scoped utility
+full utility + redundancy/noise penalty
+```
+
+First-version ablation should prioritize:
+
+```text
+without life-cycle utility
+global utility only
+global utility + LLM noise penalty
+```
+
+The expected claim is not only "higher F1", but:
+
+```text
+The memory system learns which memories are useful evidence under specific query conditions,
+improves repeated retrieval quality, and suppresses recurring noisy memories without rewriting
+or deleting raw episodic evidence.
+```
+
+### Deferred Questions Before Advanced Implementation
+
+The following details are deferred to later versions:
+
+```text
+1. Whether utility should later become scoped by question type / domain / query pattern.
+2. How to replace gold evidence dia_id diagnostics with pure reflection signals in non-labeled settings.
+3. How strongly utility should affect reranking compared with BM25, dense similarity, domain bonus, and graph score.
+4. How to prevent early online feedback noise from permanently suppressing useful memories.
+5. How to measure redundancy separately from irrelevance at scale.
+6. Whether to add exploration bonuses for uncertain but relevant memories.
+```
+
+This module should be implemented only after evidence retrieval and bundle selection reach a reasonable level, so that life-cycle updates are based on meaningful feedback rather than unstable early retrieval behavior.
+
+---
+
+## 7. Temporal Normalization as Supporting Component
+
+Temporal normalization is not a standalone innovation point. It supports Innovations B and C.
+
+### Required Functionality
+
+Detect relative temporal expressions:
+
+```text
+yesterday
+last Saturday
+last week
+next month
+last year
+```
+
+Normalize using `session_date`.
+
+Examples:
+
+```text
+8 May 2023 + yesterday = 7 May 2023
+25 May 2023 + last Saturday = Saturday before 25 May 2023
+9 June 2023 + last week = the week before 9 June 2023
+```
+
+### Prompt Formatting
+
+For temporal QA, include normalized time in the evidence bundle.
+
+```text
+[Evidence]
+Source: D3:12
+Session Date: 8 May 2023
+Speaker: Caroline
+Text: "I went yesterday."
+Temporal Normalization:
+- "yesterday" relative to 8 May 2023 = 7 May 2023
+```
+
+---
+
+## 7. Full System Flow
+
+### 7.1 Memory Writing
+
+```text
+LoCoMo dialogue turn
+  ↓
+extract dia_id / session_id / turn_id / session_date / speaker / raw_text
+  ↓
+create immutable instance memory
+  ↓
+extract entities / noun phrases
+  ↓
+extract temporal expressions
+  ↓
+normalize temporal expressions when possible
+  ↓
+build stable episodic graph edges
+```
+
+### 7.2 Retrieval and Answering
+
+```text
+query
+  ↓
+question type classification
+  ↓
+hybrid seed retrieval
+  - embedding
+  - BM25
+  - speaker match
+  - entity match
+  - temporal cue
+  - soft domain bonus
+  ↓
+episodic graph expansion
+  ↓
+evidence-focused reranking
+  ↓
+select small role-labeled memory bundle
+  ↓
+format prompt with source ids, speakers, dates, relation reasons, and temporal normalization
+  ↓
+LLM answer
+```
+
+### 7.3 Post-answer Reflection
+
+```text
+query + retrieved bundle + raw_context + prediction + feedback
+  ↓
+bundle-level reflection
+  ↓
+diagnose bundle issues
+  ↓
+generate edit actions
+  ↓
+update retrieval weights, graph weights, memory states, grounding links, and diagnostic logs
+```
+
+---
+
+## 8. Required Logging for Debugging and Evaluation
+
+Each individual result should save:
+
+```json
+{
+  "query": "...",
+  "gold_answer": "...",
+  "pred_answer": "...",
+  "raw_context": "...",
+  "user_prompt": "...",
+  "retrieved_memory_ids": ["..."],
+  "retrieved_dia_ids": ["..."],
+  "used_edges": ["..."],
+  "question_type": "...",
+  "temporal_normalizations": ["..."],
+  "reflection_output": {}
+}
+```
+
+This is required to diagnose:
+
+```text
+whether gold evidence entered raw_context
+whether the context was answerable
+whether noise overwhelmed the evidence
+whether temporal normalization was correct
+```
+
+---
+
+## 9. Suggested Ablation Plan
+
+Run incremental ablations:
+
+```text
+B0: Original A-Mem
+B1: + raw_context / user_prompt / retrieved IDs logging
+B2: + evidence-preserving LoCoMo memory writer
+B3: + hybrid retrieval + soft domain rerank
+B4: + episodic graph retrieval
+B5: + temporal normalization support
+B6: + memory-bundle-level reflection
+```
+
+Important comparisons:
+
+```text
+hard domain filter vs soft domain bonus
+flat top-k vs retrieve-many-select-few
+embedding-only vs hybrid retrieval
+with vs without graph expansion
+with vs without temporal normalization
+with vs without bundle-level reflection
+rewrite instance memory vs no rewrite
+```
+
+---
+
+## 10. Evaluation Metrics
+
+Final QA metrics:
+
+```text
+Exact Match
+F1
+ROUGE-1 F
+METEOR
+SBERT similarity
+BERTScore if available locally
+```
+
+Retrieval diagnostics:
+
+```text
+Evidence Recall@K
+Answerable Context Rate
+Gold Evidence Rank
+Noise Ratio
+Temporal Resolution Accuracy
+Raw Instance Preservation Rate
+Rewrite Harm Rate
+Bundle Helpfulness Rate
+```
+
+These diagnostics are important because final QA metrics alone cannot explain whether failures come from retrieval, temporal reasoning, or answer generation.
+
+---
+
+## 11. Implementation Priorities
+
+### Phase 1: Must-have
+
+```text
+save raw_context and user_prompt
+save retrieved_memory_ids and dia_ids
+write LoCoMo turns with dia_id / session_date / speaker / raw_text
+disable rewrite for instance memories
+```
+
+### Phase 2: Retrieval improvement
+
+```text
+add BM25 retrieval
+add speaker/entity retrieval
+replace hard domain filtering with soft domain bonus
+select final context budget 4-6
+```
+
+### Phase 3: Graph retrieval
+
+```text
+build adjacent_turn edges
+build mentions_same_entity edges
+build same_event edges
+use question-type-specific edge expansion
+```
+
+### Phase 4: Temporal support
+
+```text
+detect relative temporal expressions
+normalize with session_date
+include normalized dates in evidence bundle prompt
+```
+
+### Phase 5: Bundle reflection
+
+```text
+log bundle-level feedback
+implement ADD / PRUNE / SUBSTITUTE / GROUND first
+later add MERGE / SPLIT / CONTRADICT / ABSTRACT
+```
+
+---
+
+## 12. Constraints
+
+The following constraints must be preserved:
+
+```text
+1. Raw LoCoMo instance memories must not be rewritten.
+2. Updates/replaces/conflicts_with are not persistent graph edges.
+3. Domain routing must not hard-filter the memory pool.
+4. Final context should be a small evidence bundle, not a large flat top-k list.
+5. Summary or derived memories must be grounded in raw evidence.
+6. CONTRADICT is a reflection action, not a graph edge.
+7. MERGE and ABSTRACT may create derived memories, but must not delete raw evidence.
+```
+
+---
+
+## 13. One-sentence Summary
+
+We modify A-Mem into an evidence-first episodic memory system for LoCoMo: raw dialogue turns are preserved as immutable evidence nodes; retrieval combines hybrid seed search, soft domain reranking, and episodic graph expansion; the final prompt receives a small role-labeled evidence bundle with source ids and temporal normalization; after answering, bundle-level reflection diagnoses missing evidence, noise, redundancy, ungrounded summaries, and inconsistent derived memories, then updates retrieval weights, graph weights, memory states, and grounding links without rewriting raw instance memories.
+
+---
+
+## 14. v12 Typed Graph Simplification
+
+### Motivation
+
+The v9 typed graph experiments showed that most graph contribution came from `graph_similar_event`, while newly introduced typed edges rarely became dominant retrieval evidence. The likely reason is not only the edge idea itself, but the implementation:
+
+```text
+- Too many public relation types made the graph difficult to interpret and ablate.
+- Some relations encoded broad answer slots rather than concrete evidence chains.
+- Newly introduced typed relations were mostly used as weak candidate scores, not explicitly shown in the final answer context.
+- Storyline tags such as books_music, art, and pets_items were too coarse for LoCoMo evidence matching.
+```
+
+### Retained Public Edge Types
+
+v12 uses a smaller public edge vocabulary:
+
+```text
+local_context
+similar_event
+same_character
+same_storyline
+image_text_pair
+```
+
+The following v9 edge types are no longer generated as public offline graph relations:
+
+```text
+same_answer_slot
+shared_activity
+shared_artifact
+temporal_followup
+before_after
+local_evidence_pair
+supports
+derived_from
+clarifies_answer
+```
+
+Their useful information is folded into `same_storyline` as concrete cue evidence and edge reason text.
+
+### Deterministic Storyline Cue Extraction
+
+v12 does not use an LLM to extract storyline cues in the main graph construction path. This keeps the graph deterministic, cheaper to rebuild, and easier to ablate.
+
+Each memory now gets a concrete cue profile:
+
+```python
+{
+    "speaker": speaker,
+    "storyline_cues": set(...),
+    "strong_cues": set(...),
+    "visual_cues": set(...),
+    "cue_types": {
+        "person": set(...),
+        "visual": set(...),
+        "object": set(...),
+        "activity": set(...),
+    },
+}
+```
+
+Cue sources:
+
+```text
+speaker
+content
+image_caption
+image_query
+memory context
+keywords
+tags
+domain paths
+```
+
+Cue extraction rules:
+
+```text
+- quoted phrases
+- capitalized spans
+- keyword/tag/domain short phrases
+- ordered bigrams/trigrams from content tokens
+- protected high-value phrases such as mental health, adoption agency, single parent, LGBTQ support group
+- visual cues from image caption/query when present
+```
+
+The extractor filters structural and conversational noise:
+
+```text
+dia, speaker, session, content, conversation, memory, image, photo,
+you, what, how, good, thanks, cool, wow, support, story, etc.
+```
+
+### New `same_storyline` Rule
+
+`same_storyline` is created from concrete shared cues, not broad tags.
+
+```text
+same speaker + shared strong cue >= 1 -> same_storyline
+same speaker + shared non-person cue >= 2 -> same_storyline
+different speaker + shared strong cue >= 2 -> same_storyline
+chronological cross-session pair + shared strong cue -> same_storyline
+```
+
+Edge reason explicitly records the cue evidence:
+
+```text
+Shared concrete storyline cues: adoption, adoption agency, agency
+Shared concrete storyline cues: mental health; chronological follow-up across sessions
+```
+
+### New `image_text_pair` Rule
+
+`image_text_pair` is only created when an image-derived cue overlaps another memory's storyline cue within nearby same-session turns:
+
+```text
+same session nearby
+visual_cues(left) overlap storyline_cues(right)
+or visual_cues(right) overlap storyline_cues(left)
+```
+
+This replaces the earlier broad rule that linked nearby turns whenever an artifact tag was present.
+
+### Final Context Exposure
+
+v12 exposes typed graph structure to the answer LLM instead of hiding it inside retrieval scores.
+
+Final context can now include:
+
+```text
+relation: same_storyline
+edge reason: Shared concrete storyline cues: adoption, adoption agency, agency
+talk start time: ...
+memory content: ...
+```
+
+This is intended to make graph expansion interpretable and measurable in result JSON files.
+
+### Expected Diagnostics
+
+The v12 run should be judged by both retrieval and answer metrics:
+
+```text
+relation_counts.same_storyline in raw_context
+graph_same_storyline in candidate_debug.source_tags
+gold evidence rescued by same_storyline expansion
+evidence_hit_any / evidence_hit_all
+F1 / EM
+Not-mentioned rate by question type
+```
+
+If `same_storyline` improves evidence_hit_all but F1 does not improve, the remaining bottleneck is answer generation rather than graph retrieval.

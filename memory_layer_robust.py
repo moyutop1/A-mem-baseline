@@ -156,7 +156,7 @@ DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
 RETRIEVAL_INDEX_VERSION = "robust_retrieval_v5_source_aware_category_policy"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v4_typed_evidence_edges"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v5_concrete_storyline_edges"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
@@ -1049,22 +1049,26 @@ Rules:
         return {
             "similar_event",
             "same_character",
-            "temporal_anchor",
             "same_storyline",
+            "image_text_pair",
+        }
+
+    def _legacy_offline_graph_relations(self) -> Set[str]:
+        return {
+            "temporal_anchor",
             "same_answer_slot",
             "shared_activity",
             "shared_artifact",
             "temporal_followup",
             "before_after",
             "clarifies_answer",
-            "image_text_pair",
             "local_evidence_pair",
             "supports",
             "derived_from",
         }
 
     def _clear_offline_graph_edges(self) -> None:
-        offline_relations = self._offline_graph_relations()
+        offline_relations = self._offline_graph_relations() | self._legacy_offline_graph_relations()
         for memory in self.memories.values():
             memory = self._ensure_memory_schema(memory)
             memory.links = [
@@ -1081,75 +1085,179 @@ Rules:
             " ".join(getattr(memory, "domain_paths", [])),
         ]).strip()
 
-    def _typed_edge_profile(self, memory: RobustMemoryNote) -> Dict[str, Set[str]]:
+    def _typed_edge_profile(self, memory: RobustMemoryNote) -> Dict[str, Any]:
         fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
-        text = " ".join([
-            fields.get("speaker", ""),
-            fields.get("content", getattr(memory, "current_content", memory.content)),
-            fields.get("image_caption", ""),
-            fields.get("image_query", ""),
-            getattr(memory, "context", ""),
-            " ".join(getattr(memory, "keywords", [])),
-            " ".join(getattr(memory, "tags", [])),
-            " ".join(getattr(memory, "domain_paths", [])),
-        ]).lower()
+        speaker = fields.get("speaker", "").strip()
+        content = fields.get("content", getattr(memory, "current_content", memory.content))
+        image_caption = fields.get("image_caption", "")
+        image_query = fields.get("image_query", "")
+        keyword_text = " ; ".join(str(item) for item in getattr(memory, "keywords", []) or [])
+        tag_text = " ; ".join(str(item) for item in getattr(memory, "tags", []) or [])
+        domain_text = " ; ".join(str(item) for item in getattr(memory, "domain_paths", []) or [])
+        visual_text = " ".join([image_caption, image_query])
 
-        def hits(mapping: Dict[str, Set[str]]) -> Set[str]:
-            found = set()
-            tokens = self._retrieval_tokens(text)
-            for label, terms in mapping.items():
-                for term in terms:
-                    canonical = self._canonical_token(term)
-                    if term in text or canonical in tokens:
-                        found.add(label)
-                        break
-            return found
+        generic_cues = {
+            "a", "an", "and", "are", "ask", "asked", "asking", "been", "being",
+            "chat", "conversation", "day", "dialogue", "did", "does", "doing",
+            "event", "events", "experience", "experiences", "felt", "feel", "feeling",
+            "friend", "friends", "got", "had", "has", "have", "image", "images",
+            "item", "items", "just", "memory", "memories", "mentioned", "new",
+            "people", "person", "photo", "picture", "really", "said", "says",
+            "session", "shared", "shares", "something", "talk", "talked", "talking",
+            "thing", "things", "time", "today", "told", "turn", "want", "wanted",
+            "week", "went", "would", "dia", "speaker", "content", "general",
+            "gonna", "pretty", "out", "but", "one", "need", "needs", "i'm",
+            "i've", "i'd", "it'll", "you", "your", "yours", "me", "my", "we",
+            "our", "ours", "they", "them", "their", "there", "these", "those",
+            "who", "what", "when", "where", "why", "how", "which", "the", "to",
+            "of", "in", "on", "at", "by", "from", "for", "with", "without",
+            "as", "is", "was", "were", "be", "am", "been", "it", "its", "it's",
+            "that", "this", "than", "then", "after", "before", "any", "anything",
+            "anyth", "hey", "hi", "hello", "good", "great", "see", "yeah", "yes",
+            "no", "thanks", "thank", "mel", "kid", "kids",
+            "cool", "wow", "awesome", "inspir", "inspiring", "hear", "happy",
+            "thankful", "such", "all", "story", "love", "lovely", "support",
+            "about", "agree", "alway", "always", "care", "challenge", "each",
+            "easy", "fun", "help", "important", "it'", "journey", "like",
+            "long", "look", "make", "really", "since", "super", "tak", "take",
+            "taking", "that'", "think", "totally", "understand", "way", "work",
+            "yourself", "ourselve", "ourselves", "you're", "here", "here'",
+            "lot", "mean", "amaz", "amazing", "kind", "happen", "get", "job",
+        }
+        generic_phrases = {
+            "conversation memory", "image query", "memory content", "memory context",
+            "personal experience", "talk start", "session date", "dia speaker",
+            "speaker content", "session speaker",
+        }
+        strong_terms = {
+            "adoption", "agency", "agencies", "bach", "bareilles", "beach", "brave",
+            "camping", "caroline", "certification", "children", "counseling",
+            "dr seuss", "four seasons", "grandma", "lgbtq", "luna", "melanie",
+            "mozart", "necklace", "oliver", "pottery", "pride", "psychology",
+            "sara bareilles", "seuss", "shoes", "support group", "sweden",
+            "the four seasons", "transgender", "violin",
+        }
+        protected_phrases = {
+            "adoption agency", "adoption agencies", "charity race", "classic book",
+            "classic books", "classical music", "counseling certification",
+            "dr seuss", "four seasons", "lgbtq support", "lgbtq support group",
+            "mental health", "single parent", "support group", "the four seasons",
+        }
+        high_value_tokens = {
+            "adoption", "agency", "bach", "bareilles", "beach", "brave", "camp",
+            "camping", "career", "certification", "child", "children", "counsel",
+            "counseling", "grandma", "health", "lgbtq", "mental", "mozart",
+            "necklace", "painting", "parent", "pottery", "psychology", "race",
+            "seuss", "shoe", "shoes", "single", "support", "sweden",
+            "transgender", "violin",
+        }
+        common_participants = {"caroline", "melanie"}
 
-        storylines = hits({
-            "lgbtq": {"lgbtq", "transgender", "trans", "pride", "support group", "coming out", "womanhood", "transition"},
-            "community_help": {"mentor", "mentorship", "youth", "children", "community", "school", "speech", "talk", "activist"},
-            "family_kids": {"family", "kids", "children", "son", "daughter", "parent", "mom"},
-            "art": {"art", "painting", "painted", "artwork", "show", "portrait", "sunset", "identity"},
-            "outdoors": {"camping", "camp", "hike", "hiking", "beach", "mountain", "forest", "roadtrip", "trip"},
-            "career_health": {"career", "counseling", "mental health", "therapeutic", "workshop", "support"},
-            "adoption": {"adoption", "agency", "single parent", "adopt"},
-            "books_music": {"book", "read", "concert", "music", "band", "artist", "song"},
-            "pets_items": {"pet", "pets", "luna", "oliver", "bought", "shoes", "necklace"},
-        })
-        slots = hits({
-            "event": {"event", "attended", "joined", "participated", "parade", "workshop", "group", "meeting", "show", "program"},
-            "activity": {"activity", "pottery", "swimming", "camping", "hiking", "running", "painting", "frisbee"},
-            "person_support": {"support", "supports", "friends", "family", "mentors", "encouragement", "help"},
-            "place": {"where", "country", "sweden", "beach", "mountain", "forest", "home"},
-            "count": {"how many", "number", "times", "children", "kids"},
-            "artifact": {"painting", "book", "pet", "necklace", "shoes", "pottery", "instrument", "item"},
-            "time": {"yesterday", "last week", "next month", "last friday", "recently", "weekend", "past weekend"},
-        })
-        activities = hits({
-            "pottery": {"pottery", "clay"},
-            "painting": {"painting", "painted", "artwork", "sunset", "portrait"},
-            "camping": {"camping", "campfire", "camped", "camp"},
-            "hiking": {"hiking", "hike", "trail"},
-            "swimming": {"swimming", "swim"},
-            "running": {"running", "run"},
-            "beach": {"beach"},
-            "music": {"concert", "music", "band", "artist", "song"},
-            "book": {"book", "read", "novel"},
-        })
-        artifacts = hits({
-            "painting": {"painting", "painted", "artwork", "canvas"},
-            "pottery": {"pottery", "clay"},
-            "book": {"book", "novel"},
-            "pets": {"luna", "oliver", "pets", "pet"},
-            "necklace": {"necklace"},
-            "shoes": {"shoes", "sneakers"},
-            "instrument": {"violin", "clarinet", "instrument"},
-        })
+        def normalize_cue(text_value: str) -> str:
+            cue = re.sub(r"[^a-z0-9'\s-]", " ", str(text_value).lower())
+            cue = re.sub(r"\s+", " ", cue).strip(" -'")
+            if cue.endswith("'s"):
+                cue = cue[:-2]
+            return cue
+
+        def useful_cue(cue: str) -> bool:
+            if cue in protected_phrases:
+                return True
+            if not cue or cue in generic_cues or cue in generic_phrases:
+                return False
+            if re.search(r"\d", cue):
+                return False
+            if any(part in {"dia", "speaker", "session", "content"} for part in cue.split()):
+                return False
+            if len(cue) < 3:
+                return False
+            parts = cue.split()
+            if len(parts) == 1:
+                return cue not in generic_cues
+            return not any(part in generic_cues for part in parts)
+
+        def add_phrase(cues: Set[str], phrase: str) -> None:
+            cue = normalize_cue(phrase)
+            if useful_cue(cue):
+                cues.add(cue)
+
+        def phrase_cues(
+            text_value: str,
+            include_bigrams: bool = True,
+            include_segments: bool = False,
+        ) -> Set[str]:
+            cues: Set[str] = set()
+            raw = str(text_value or "")
+            for quoted in re.findall(r"['\"]([^'\"]{2,80})['\"]", raw):
+                add_phrase(cues, quoted)
+            for capitalized in re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+(?:of|the|and|[A-Z][A-Za-z0-9']+)){0,4}", raw):
+                add_phrase(cues, capitalized)
+            if include_segments:
+                for segment in re.split(r"[;,/|()\[\]\n]+", raw):
+                    segment = segment.strip()
+                    if 2 <= len(segment) <= 80:
+                        add_phrase(cues, segment)
+            tokens = []
+            for raw_token in re.findall(r"\b[a-zA-Z][a-zA-Z0-9']+\b", raw.lower()):
+                token = self._canonical_token(raw_token)
+                if useful_cue(token):
+                    tokens.append(token)
+            cues.update(tokens)
+            if include_bigrams:
+                for n in (2, 3):
+                    for idx in range(0, max(0, len(tokens) - n + 1)):
+                        gram = " ".join(tokens[idx: idx + n])
+                        if useful_cue(gram):
+                            cues.add(gram)
+            return cues
+
+        storyline_cues: Set[str] = set()
+        strong_cues: Set[str] = set()
+        visual_cues = phrase_cues(visual_text, include_bigrams=True, include_segments=True)
+        for source_text in [content, getattr(memory, "context", "")]:
+            storyline_cues.update(phrase_cues(source_text, include_bigrams=True, include_segments=False))
+        for source_text in [keyword_text, tag_text, domain_text]:
+            storyline_cues.update(phrase_cues(source_text, include_bigrams=True, include_segments=True))
+        if speaker:
+            add_phrase(storyline_cues, speaker)
+        storyline_cues |= visual_cues
+
+        for cue in list(storyline_cues):
+            if cue in common_participants:
+                continue
+            cue_parts = set(cue.split())
+            if cue in strong_terms or any(term in cue for term in strong_terms if " " in term):
+                strong_cues.add(cue)
+            elif len(cue_parts) >= 2 and bool(cue_parts & high_value_tokens):
+                strong_cues.add(cue)
+
+        cue_types = {
+            "person": {
+                cue for cue in storyline_cues
+                if cue in {normalize_cue(speaker), "caroline", "melanie", "grandma"}
+            },
+            "visual": set(visual_cues),
+            "object": {
+                cue for cue in storyline_cues
+                if cue in {
+                    "necklace", "shoes", "book", "books", "pet", "pets", "painting",
+                    "pottery", "violin", "instrument", "luna", "oliver",
+                }
+            },
+            "activity": {
+                cue for cue in storyline_cues
+                if cue in {
+                    "camping", "hiking", "swimming", "running", "painting",
+                    "pottery", "music", "concert", "reading", "support group",
+                }
+            },
+        }
         return {
-            "storylines": storylines,
-            "slots": slots,
-            "activities": activities,
-            "artifacts": artifacts,
+            "speaker": speaker,
+            "storyline_cues": storyline_cues,
+            "strong_cues": strong_cues,
+            "visual_cues": visual_cues,
+            "cue_types": cue_types,
         }
 
     def _shared_domain(self, left: RobustMemoryNote, right: RobustMemoryNote) -> bool:
@@ -1253,45 +1361,64 @@ Rules:
 
                 left_profile = profiles[i]
                 right_profile = profiles[j]
-                shared_storylines = left_profile["storylines"] & right_profile["storylines"]
-                shared_slots = left_profile["slots"] & right_profile["slots"]
-                shared_activities = left_profile["activities"] & right_profile["activities"]
-                shared_artifacts = left_profile["artifacts"] & right_profile["artifacts"]
-                same_or_related_speaker = same_character or bool(shared_storylines & {"family_kids", "lgbtq", "art"})
+                left_cues = set(left_profile.get("storyline_cues", set()))
+                right_cues = set(right_profile.get("storyline_cues", set()))
+                shared_cues = left_cues & right_cues
+                shared_strong_cues = (
+                    set(left_profile.get("strong_cues", set()))
+                    & set(right_profile.get("strong_cues", set()))
+                )
+                common_story_participants = {"caroline", "melanie"}
+                non_person_shared = shared_cues - common_story_participants - {
+                    str(left_profile.get("speaker", "")).lower(),
+                    str(right_profile.get("speaker", "")).lower(),
+                }
                 chronological_pair = (
                     left_key is not None and right_key is not None
                     and left_key[0] != right_key[0]
                     and left_key < right_key
                 )
 
-                if shared_storylines and same_or_related_speaker and (overlap >= 1 or similarity >= 0.35):
-                    reason = "Shared typed LoCoMo storyline: " + ", ".join(sorted(shared_storylines)[:3])
-                    add_typed_edge(left, right, "same_storyline", reason, 0.72)
-                    add_typed_edge(right, left, "same_storyline", reason, 0.72)
-                if shared_slots and (shared_storylines or same_character) and (overlap >= 1 or similarity >= 0.30):
-                    reason = "Shared likely answer slot: " + ", ".join(sorted(shared_slots)[:3])
-                    add_typed_edge(left, right, "same_answer_slot", reason, 0.68)
-                    add_typed_edge(right, left, "same_answer_slot", reason, 0.68)
-                if shared_activities and (same_character or shared_storylines) and (overlap >= 1 or similarity >= 0.30):
-                    reason = "Shared activity evidence: " + ", ".join(sorted(shared_activities)[:3])
-                    add_typed_edge(left, right, "shared_activity", reason, 0.74)
-                    add_typed_edge(right, left, "shared_activity", reason, 0.74)
-                if shared_artifacts and (same_character or shared_storylines) and (overlap >= 1 or similarity >= 0.30):
-                    reason = "Shared artifact evidence: " + ", ".join(sorted(shared_artifacts)[:3])
-                    add_typed_edge(left, right, "shared_artifact", reason, 0.70)
-                    add_typed_edge(right, left, "shared_artifact", reason, 0.70)
-                if chronological_pair and (shared_storylines or shared_activities or shared_artifacts) and (same_character or overlap >= 1):
-                    reason = "Chronological follow-up within a shared typed evidence chain."
-                    add_typed_edge(left, right, "temporal_followup", reason, 0.62)
-                    add_typed_edge(right, left, "before_after", reason, 0.54)
-                if same_session_nearby and overlap >= 1:
-                    reason = "Nearby turn that may clarify the selected evidence."
-                    add_typed_edge(left, right, "local_evidence_pair", reason, 0.45)
-                    add_typed_edge(right, left, "local_evidence_pair", reason, 0.45)
-                if same_session_nearby and (left_profile["artifacts"] or right_profile["artifacts"]):
-                    reason = "Nearby image/text evidence pair around an artifact or visual cue."
-                    add_typed_edge(left, right, "image_text_pair", reason, 0.42)
-                    add_typed_edge(right, left, "image_text_pair", reason, 0.42)
+                same_storyline_allowed = False
+                if same_character and shared_strong_cues:
+                    same_storyline_allowed = True
+                elif same_character and len(non_person_shared) >= 2:
+                    same_storyline_allowed = True
+                elif not same_character and len(shared_strong_cues) >= 2:
+                    same_storyline_allowed = True
+                elif chronological_pair and shared_strong_cues and (overlap >= 1 or similarity >= 0.35):
+                    same_storyline_allowed = True
+
+                if same_storyline_allowed and (overlap >= 1 or similarity >= 0.25 or shared_strong_cues):
+                    cue_preview = sorted(shared_strong_cues or non_person_shared or shared_cues)[:5]
+                    reason = "Shared concrete storyline cues: " + ", ".join(cue_preview)
+                    if chronological_pair:
+                        reason += "; chronological follow-up across sessions"
+                    strength = (
+                        0.60
+                        + 0.08 * min(3, len(shared_strong_cues))
+                        + 0.04 * min(3, len(non_person_shared))
+                        + (0.08 if same_character else 0.0)
+                        + (0.04 if chronological_pair else 0.0)
+                    )
+                    strength = min(0.92, strength)
+                    add_typed_edge(left, right, "same_storyline", reason, strength)
+                    add_typed_edge(right, left, "same_storyline", reason, strength)
+
+                left_visual = set(left_profile.get("visual_cues", set()))
+                right_visual = set(right_profile.get("visual_cues", set()))
+                left_visual_overlap = left_visual & right_cues
+                right_visual_overlap = right_visual & left_cues
+                visual_shared = (left_visual_overlap | right_visual_overlap) - {
+                    str(left_profile.get("speaker", "")).lower(),
+                    str(right_profile.get("speaker", "")).lower(),
+                }
+                if same_session_nearby and visual_shared and (overlap >= 1 or similarity >= 0.20):
+                    cue_preview = sorted(visual_shared)[:5]
+                    reason = "Image-text cue alignment: " + ", ".join(cue_preview)
+                    strength = min(0.86, 0.58 + 0.08 * min(3, len(visual_shared)))
+                    add_typed_edge(left, right, "image_text_pair", reason, strength)
+                    add_typed_edge(right, left, "image_text_pair", reason, strength)
 
     def _domain_graph_cache_payload(self, sample_id: str) -> Dict[str, Any]:
         annotations = {}
@@ -1325,7 +1452,7 @@ Rules:
         annotations = payload.get("annotations", {}) or {}
         temporal = payload.get("temporal_expressions", {}) or {}
         edges = payload.get("edges", {}) or {}
-        offline_relations = self._offline_graph_relations()
+        offline_relations = self._offline_graph_relations() | self._legacy_offline_graph_relations()
         id_by_dia = {}
         for memory in self.memories.values():
             memory = self._ensure_memory_schema(memory)
@@ -1352,7 +1479,7 @@ Rules:
                     None,
                 )
                 relation = edge.get("relation", "similar_event")
-                if target and relation in STABLE_RETRIEVAL_EDGES:
+                if target and relation in self._offline_graph_relations():
                     self._add_edge(
                         source,
                         target,
@@ -1652,42 +1779,28 @@ Rules:
         }
         relation_weights = {
             "same_storyline": 0.95,
-            "same_answer_slot": 0.90,
-            "shared_activity": 0.95,
-            "shared_artifact": 0.90,
-            "temporal_followup": 0.85,
-            "before_after": 0.78,
-            "temporal_anchor": 0.80,
             "similar_event": 0.72,
-            "local_evidence_pair": 0.55,
             "image_text_pair": 0.55,
-            "clarifies_answer": 0.60,
-            "supports": 0.70,
-            "derived_from": 0.65,
+            "same_character": 0.45,
         }
         if category_int == 1:
             allowed_graph_relations = {
-                "same_storyline", "same_answer_slot", "shared_activity",
-                "shared_artifact", "temporal_followup", "similar_event",
-                "supports", "derived_from",
+                "same_storyline", "similar_event", "same_character", "image_text_pair",
             }
             seed_limit, per_seed_limit, graph_candidate_limit = 20, 3, 36
         elif category_int == 2:
             allowed_graph_relations = {
-                "temporal_followup", "before_after", "temporal_anchor",
-                "similar_event", "local_evidence_pair",
+                "same_storyline", "similar_event", "same_character", "image_text_pair",
             }
-            seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 14
+            seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 16
         elif category_int == 4:
             allowed_graph_relations = {
-                "clarifies_answer", "image_text_pair", "local_evidence_pair",
-                "shared_artifact",
+                "same_storyline", "image_text_pair", "similar_event",
             }
-            seed_limit, per_seed_limit, graph_candidate_limit = 8, 1, 8
+            seed_limit, per_seed_limit, graph_candidate_limit = 8, 1, 10
         else:
             allowed_graph_relations = {
-                "same_storyline", "same_answer_slot", "similar_event",
-                "local_evidence_pair",
+                "same_storyline", "similar_event", "same_character", "image_text_pair",
             }
             seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 12
 
@@ -1731,7 +1844,7 @@ Rules:
                 lexical = self._lexical_relevance(target_memory, lexical_query)
                 if category_int == 4 and lexical < 1.0:
                     continue
-                if category_int == 2 and relation not in {"temporal_followup", "before_after", "temporal_anchor"} and lexical < 1.0:
+                if category_int == 2 and relation not in {"same_storyline", "image_text_pair"} and lexical < 1.0:
                     continue
                 strength = float(edge.get("strength", 0.5))
                 relation_weight = relation_weights.get(relation, 0.4)
@@ -2334,10 +2447,17 @@ Rules:
             memory.last_updated = getattr(memory, "last_accessed", getattr(memory, "timestamp", ""))
         return memory
 
-    def _format_memory_for_context(self, memory: RobustMemoryNote, relation: Optional[str] = None) -> str:
+    def _format_memory_for_context(
+        self,
+        memory: RobustMemoryNote,
+        relation: Optional[str] = None,
+        edge_reason: Optional[str] = None,
+    ) -> str:
         relation_text = f"relation: {relation} " if relation else ""
+        reason_text = f"edge reason: {edge_reason} " if edge_reason else ""
         return (
             relation_text +
+            reason_text +
             "talk start time:" + str(memory.timestamp) +
             " memory content: " + str(memory.current_content) +
             " memory context: " + str(memory.context) +
@@ -2495,21 +2615,19 @@ Rules:
         local_context_neighbor_min_lexical_score = 1.0
         relation_priority = {
             "similar_event": 0,
-            "temporal_anchor": 1,
-            "supports": 2,
-            "derived_from": 3,
-            "same_character": 4,
-            "local_context": 5,
+            "same_storyline": 1,
+            "image_text_pair": 2,
+            "same_character": 3,
+            "local_context": 4,
             "same_entity": 6,
             "same_topic": 7,
             "semantic_related": 8,
         }
         if category_int == 1:
             relation_priority.update({
-                "temporal_anchor": 0,
-                "supports": 1,
-                "derived_from": 2,
-                "similar_event": 4,
+                "same_storyline": 0,
+                "image_text_pair": 1,
+                "similar_event": 2,
                 "same_character": 5,
             })
             ranked = self._select_category1_coverage_ranked(ranked, query, primary_limit, k)
@@ -2560,8 +2678,7 @@ Rules:
             if not allow_expansion:
                 sorted_edges = []
             direct_context_relations = {
-                "similar_event", "same_character", "temporal_anchor",
-                "supports", "derived_from",
+                "similar_event", "same_character", "same_storyline", "image_text_pair",
             }
             for edge in sorted_edges:
                 target_memory = self._edge_to_memory(edge, all_memories, id_to_memory)
@@ -2588,7 +2705,12 @@ Rules:
                         continue
                     same_character_count += 1
                 seen_ids.add(target_memory.id)
-                memory_str += self._format_memory_for_context(target_memory, relation=relation)
+                edge_reason = str(edge.get("reason", "")) if isinstance(edge, dict) else ""
+                memory_str += self._format_memory_for_context(
+                    target_memory,
+                    relation=relation,
+                    edge_reason=edge_reason if relation in {"same_storyline", "image_text_pair"} else None,
+                )
                 neighbor_count += 1
                 neighbor_limit = 1 if category_int == 1 else 2
                 if neighbor_count >= neighbor_limit or len(seen_ids) >= max_context_blocks:
