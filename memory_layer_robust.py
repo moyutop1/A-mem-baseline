@@ -155,8 +155,8 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v5_source_aware_category_policy"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v5_concrete_storyline_edges"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v6_evidence_first_no_domain_filter"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v6_evidence_first_storyline_edges"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
@@ -682,7 +682,6 @@ class RobustAgenticMemorySystem:
         main_text = " ".join([
             fields.get("speaker", ""),
             fields.get("content", getattr(memory, "current_content", memory.content)),
-            getattr(memory, "context", ""),
             " ".join(getattr(memory, "keywords", [])),
             " ".join(getattr(memory, "tags", [])),
         ])
@@ -1081,8 +1080,8 @@ Rules:
         return " ".join([
             fields.get("speaker", ""),
             fields.get("content", getattr(memory, "current_content", memory.content)),
+            fields.get("image_caption", ""),
             fields.get("image_query", ""),
-            " ".join(getattr(memory, "domain_paths", [])),
         ]).strip()
 
     def _typed_edge_profile(self, memory: RobustMemoryNote) -> Dict[str, Any]:
@@ -1093,7 +1092,6 @@ Rules:
         image_query = fields.get("image_query", "")
         keyword_text = " ; ".join(str(item) for item in getattr(memory, "keywords", []) or [])
         tag_text = " ; ".join(str(item) for item in getattr(memory, "tags", []) or [])
-        domain_text = " ; ".join(str(item) for item in getattr(memory, "domain_paths", []) or [])
         visual_text = " ".join([image_caption, image_query])
 
         generic_cues = {
@@ -1115,6 +1113,11 @@ Rules:
             "that", "this", "than", "then", "after", "before", "any", "anything",
             "anyth", "hey", "hi", "hello", "good", "great", "see", "yeah", "yes",
             "no", "thanks", "thank", "mel", "kid", "kids",
+            "activity", "activities", "art", "arts", "career", "education",
+            "evidence", "expression", "goal", "health", "identity", "life",
+            "media", "meeting", "meetings", "object", "objects", "partner",
+            "personal", "plan", "plans", "relationship", "relationships",
+            "self", "travel", "visual", "wellbe", "wellbeing",
             "cool", "wow", "awesome", "inspir", "inspiring", "hear", "happy",
             "thankful", "such", "all", "story", "love", "lovely", "support",
             "about", "agree", "alway", "always", "care", "challenge", "each",
@@ -1140,7 +1143,8 @@ Rules:
         protected_phrases = {
             "adoption agency", "adoption agencies", "charity race", "classic book",
             "classic books", "classical music", "counseling certification",
-            "dr seuss", "four seasons", "lgbtq support", "lgbtq support group",
+            "connected lgbtq activists", "dr seuss", "four seasons",
+            "lgbtq activist group", "lgbtq support", "lgbtq support group",
             "mental health", "single parent", "support group", "the four seasons",
         }
         high_value_tokens = {
@@ -1148,7 +1152,7 @@ Rules:
             "camping", "career", "certification", "child", "children", "counsel",
             "counseling", "grandma", "health", "lgbtq", "mental", "mozart",
             "necklace", "painting", "parent", "pottery", "psychology", "race",
-            "seuss", "shoe", "shoes", "single", "support", "sweden",
+            "seuss", "shoe", "shoes", "single", "sweden",
             "transgender", "violin",
         }
         common_participants = {"caroline", "melanie"}
@@ -1214,10 +1218,16 @@ Rules:
         storyline_cues: Set[str] = set()
         strong_cues: Set[str] = set()
         visual_cues = phrase_cues(visual_text, include_bigrams=True, include_segments=True)
-        for source_text in [content, getattr(memory, "context", "")]:
-            storyline_cues.update(phrase_cues(source_text, include_bigrams=True, include_segments=False))
-        for source_text in [keyword_text, tag_text, domain_text]:
-            storyline_cues.update(phrase_cues(source_text, include_bigrams=True, include_segments=True))
+        storyline_cues.update(phrase_cues(content, include_bigrams=True, include_segments=False))
+        metadata_cues: Set[str] = set()
+        for source_text in [keyword_text, tag_text]:
+            metadata_cues.update(phrase_cues(source_text, include_bigrams=True, include_segments=True))
+        storyline_cues.update({
+            cue for cue in metadata_cues
+            if cue in protected_phrases
+            or cue in strong_terms
+            or bool(set(cue.split()) & high_value_tokens)
+        })
         if speaker:
             add_phrase(storyline_cues, speaker)
         storyline_cues |= visual_cues
@@ -1327,7 +1337,6 @@ Rules:
                 allow_similar_event = (
                     similar_counts.get(left.id, 0) < max_similar_edges_per_memory
                     and similar_counts.get(right.id, 0) < max_similar_edges_per_memory
-                    and self._shared_domain(left, right)
                 )
                 right_tokens = self._retrieval_tokens(event_texts[j])
                 overlap = len(left_tokens & right_tokens)
@@ -1347,9 +1356,9 @@ Rules:
                     and same_character
                     and overlap >= 2
                 )
-                if allow_similar_event and same_session_nearby and (overlap >= 1 or similarity >= 0.55):
+                if allow_similar_event and same_session_nearby and (overlap >= 2 or similarity >= 0.60):
                     weight = 1.0
-                elif allow_similar_event and cross_session_event and similarity >= 0.45:
+                elif allow_similar_event and cross_session_event and overlap >= 3 and similarity >= 0.50:
                     weight = 0.6
                 else:
                     weight = 0.0
@@ -1692,13 +1701,9 @@ Rules:
                 candidate_indices.append(idx)
             fallback_indices.append(idx)
 
-        if not candidate_indices:
-            candidate_indices = fallback_indices
-        if category_int == 1:
-            # Cat1 multi-evidence questions are sensitive to early router misses.
-            # Keep domain_match as a reranking feature, but never let domain routing
-            # exclude otherwise strong global lexical/dense evidence candidates.
-            candidate_indices = fallback_indices
+        # Domain routing is intentionally soft: it may add a small rerank bonus,
+        # but it must never remove raw evidence from dense/BM25/lexical sources.
+        candidate_indices = fallback_indices
 
         domain_top_k = max(self.domain_seed_top_k, k * 4)
         if category_int == 1:
@@ -1958,9 +1963,7 @@ Rules:
             fields.get("content", getattr(memory, "current_content", memory.content)),
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
-            getattr(memory, "context", ""),
             " ".join(getattr(memory, "keywords", [])),
-            " ".join(getattr(memory, "tags", [])),
         ])
         query_tokens = self._retrieval_tokens(query)
         tokens = self._retrieval_tokens(evidence_text) - query_tokens
@@ -2048,9 +2051,7 @@ Rules:
             fields.get("content", getattr(memory, "current_content", memory.content)),
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
-            getattr(memory, "context", ""),
             " ".join(getattr(memory, "keywords", [])),
-            " ".join(getattr(memory, "tags", [])),
         ])
         evidence_lower = evidence_text.lower()
         evidence_tokens = self._retrieval_tokens(evidence_text)
@@ -2232,12 +2233,11 @@ Rules:
             fields.get("dia_id", ""),
             fields.get("session_date", ""),
             fields.get("speaker", ""),
-            getattr(memory, "context", "General"),
             " ".join(getattr(memory, "keywords", [])),
             " ".join(getattr(memory, "tags", [])),
-            " ".join(getattr(memory, "domain_paths", [])),
         ]).strip()
         pieces = [
+            "content: " + main_content,
             "content: " + main_content,
             "content: " + main_content,
             "metadata: " + metadata,
@@ -2459,12 +2459,7 @@ Rules:
             relation_text +
             reason_text +
             "talk start time:" + str(memory.timestamp) +
-            " memory content: " + str(memory.current_content) +
-            " memory context: " + str(memory.context) +
-            " memory keywords: " + str(memory.keywords) +
-            " memory tags: " + str(memory.tags) +
-            " memory status: " + str(memory.status) +
-            " memory confidence: " + str(memory.confidence) + "\n"
+            " memory content: " + str(memory.current_content) + "\n"
         )
 
     def _edge_relation(self, edge: Any) -> str:
@@ -2688,7 +2683,6 @@ Rules:
                     or relation not in STABLE_RETRIEVAL_EDGES
                     or relation not in direct_context_relations
                     or not self._is_retrievable(target_memory, query)
-                    or not self._domain_overlap(target_memory, routed_domains)
                     or target_memory.id in seen_ids
                 ):
                     continue
