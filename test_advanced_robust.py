@@ -665,6 +665,88 @@ Short answer:"""
         return response, user_prompt, raw_context
 
 
+class LLMJudgeEvaluator:
+    """Reference-guided binary LLM judge for short-answer QA accuracy."""
+
+    def __init__(
+        self,
+        model: str,
+        backend: str,
+        sglang_host: str = "http://localhost",
+        sglang_port: int = 30000,
+    ):
+        self.model = model
+        self.backend = backend
+        self.controller = RobustLLMController(
+            backend=backend,
+            model=model,
+            api_key=None,
+            sglang_host=sglang_host,
+            sglang_port=sglang_port,
+        )
+
+    @staticmethod
+    def _parse_response(response: str) -> Dict[str, object]:
+        response = str(response or "").strip()
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            try:
+                payload = json.loads(match.group(0))
+                score = int(payload.get("score", 0))
+                return {
+                    "score": 1 if score == 1 else 0,
+                    "reason": str(payload.get("reason", "")).strip(),
+                    "raw_response": response,
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        lowered = response.lower()
+        if re.search(r"\b(correct|yes|equivalent)\b", lowered) and not re.search(r"\bincorrect\b", lowered):
+            return {"score": 1, "reason": response[:300], "raw_response": response}
+        return {"score": 0, "reason": response[:300], "raw_response": response}
+
+    def judge(self, question: str, reference: str, prediction: str) -> Dict[str, object]:
+        if not str(reference or "").strip() or not str(prediction or "").strip():
+            return {
+                "score": 0,
+                "reason": "Missing reference or prediction.",
+                "raw_response": "",
+                "judge_model": self.model,
+                "judge_backend": self.backend,
+            }
+        prompt = f"""You are evaluating a short-answer QA system for the LoCoMo benchmark.
+
+Question:
+{question}
+
+Gold answer:
+{reference}
+
+Predicted answer:
+{prediction}
+
+Decide whether the predicted answer is semantically correct.
+Ignore minor wording, capitalization, punctuation, word order, and harmless extra words.
+Mark correct if the predicted answer contains the same key meaning as the gold answer.
+Mark incorrect if it misses the key answer, contradicts the gold answer, answers a different question, or says the answer is not mentioned when the gold answer is present.
+
+Return JSON only:
+{{"score": 1 or 0, "reason": "brief reason"}}"""
+        try:
+            response = self.controller.llm.get_completion(prompt, temperature=0.0)
+            parsed = self._parse_response(response)
+        except Exception as e:
+            logger.warning("LLM judge failed: %s; assigning score 0", e)
+            parsed = {
+                "score": 0,
+                "reason": f"Judge call failed: {e}",
+                "raw_response": "",
+            }
+        parsed["judge_model"] = self.model
+        parsed["judge_backend"] = self.backend
+        return parsed
+
+
 def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     """Set up logging configuration."""
     eval_logger = logging.getLogger('locomo_eval_robust')
@@ -688,7 +770,12 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      temperature_c5: float = 0.5, retrieve_k: int = 10,
                      sglang_host: str = "http://localhost", sglang_port: int = 30000,
                      allow_categories: Optional[List[int]] = None,
-                     compress_categories: Optional[Set[int]] = None):
+                     compress_categories: Optional[Set[int]] = None,
+                     use_llm_judge: bool = False,
+                     judge_backend: Optional[str] = None,
+                     judge_model: Optional[str] = None,
+                     judge_sglang_host: Optional[str] = None,
+                     judge_sglang_port: Optional[int] = None):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -725,6 +812,23 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     compress_categories = compress_categories or set()
     eval_logger.info(f"Evaluating categories: {allow_categories}")
     eval_logger.info(f"Compressing retrieved context for categories: {sorted(compress_categories)}")
+    judge_evaluator = None
+    if use_llm_judge:
+        judge_backend = judge_backend or backend
+        judge_model = judge_model or model
+        judge_sglang_host = judge_sglang_host or sglang_host
+        judge_sglang_port = int(judge_sglang_port or sglang_port)
+        judge_evaluator = LLMJudgeEvaluator(
+            model=judge_model,
+            backend=judge_backend,
+            sglang_host=judge_sglang_host,
+            sglang_port=judge_sglang_port,
+        )
+        eval_logger.info(
+            "LLM judge enabled with backend=%s model=%s",
+            judge_backend,
+            judge_model,
+        )
 
     for sample_idx, sample in enumerate(samples):
         # agent指的并不是真正意义上的agent，而是一个封装了内存系统和LLM控制器的类，
@@ -851,6 +955,19 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
                     "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
                 }
+                judge_result = None
+                if judge_evaluator is not None:
+                    judge_result = judge_evaluator.judge(
+                        qa.question,
+                        qa.final_answer or "",
+                        prediction,
+                    )
+                    metrics["llm_judge_score"] = float(judge_result.get("score", 0))
+                    eval_logger.info(
+                        "LLM Judge Score: %s Reason: %s",
+                        judge_result.get("score"),
+                        judge_result.get("reason"),
+                    )
 
                 all_metrics.append(metrics)
                 all_categories.append(qa.category)
@@ -880,6 +997,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     "retrieval_diagnostics": retrieval_diagnostics,
                     "answer_diagnostics": dict(getattr(agent, "last_answer_debug", {}) or {}),
                 }
+                if judge_result is not None:
+                    result["llm_judge"] = judge_result
                 results.append(result)
 
                 if total_questions % 10 == 0:
@@ -893,6 +1012,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "memory_layer": "robust",
         "compress_context": bool(compress_categories),
         "compress_categories": sorted(compress_categories),
+        "llm_judge_enabled": bool(use_llm_judge),
+        "judge_backend": judge_backend if use_llm_judge else None,
+        "judge_model": judge_model if use_llm_judge else None,
+        "metric_aliases": {"J": "llm_judge_score"} if use_llm_judge else {},
         "total_questions": total_questions,
         "category_distribution": {
             str(cat): count for cat, count in category_counts.items()
@@ -952,6 +1075,16 @@ def main():
                         help="Compress retrieved memories for all categories before answering")
     parser.add_argument("--compress_categories", type=str, default=None,
                         help="Comma-separated categories to compress, e.g. '1,2'. Overrides the default no-compression behavior")
+    parser.add_argument("--llm_judge", action="store_true",
+                        help="Add binary LLM-Judge score (J) using question, reference, and prediction")
+    parser.add_argument("--judge_backend", type=str, default=None,
+                        help="Optional judge backend. Defaults to --backend")
+    parser.add_argument("--judge_model", type=str, default=None,
+                        help="Optional judge model. Defaults to --model")
+    parser.add_argument("--judge_sglang_host", type=str, default=None,
+                        help="Optional judge SGLang host. Defaults to --sglang_host")
+    parser.add_argument("--judge_sglang_port", type=int, default=None,
+                        help="Optional judge SGLang port. Defaults to --sglang_port")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
     parser.add_argument("--sglang_port", type=int, default=30000,
@@ -992,7 +1125,8 @@ def main():
         dataset_path, args.model, output_path, args.ratio,
         args.backend, args.temperature_c5, args.retrieve_k,
         args.sglang_host, args.sglang_port, allow_categories,
-        compress_categories,
+        compress_categories, args.llm_judge, args.judge_backend,
+        args.judge_model, args.judge_sglang_host, args.judge_sglang_port,
     )
 
 
