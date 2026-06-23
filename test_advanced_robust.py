@@ -22,7 +22,7 @@ import json
 import argparse
 import logging
 import re
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from pathlib import Path
 import numpy as np
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
@@ -315,6 +315,10 @@ Keywords:"""
         return f"{date_value.day} {date_value.strftime('%B %Y')}"
 
     @staticmethod
+    def _format_month_year(year: int, month: int) -> str:
+        return datetime(year, month, 1).strftime("%B %Y")
+
+    @staticmethod
     def _canonical_weekday(raw_weekday: str) -> str:
         weekday = raw_weekday.lower().rstrip(".")
         if weekday.startswith("mon"):
@@ -332,6 +336,179 @@ Keywords:"""
         if weekday.startswith("sun"):
             return "Sunday"
         return raw_weekday.capitalize()
+
+    @staticmethod
+    def _previous_month(session_dt: datetime) -> Tuple[int, int]:
+        month = session_dt.month - 1
+        year = session_dt.year
+        if month < 1:
+            month = 12
+            year -= 1
+        return year, month
+
+    @staticmethod
+    def _next_month(session_dt: datetime) -> Tuple[int, int]:
+        month = session_dt.month + 1
+        year = session_dt.year
+        if month > 12:
+            month = 1
+            year += 1
+        return year, month
+
+    @classmethod
+    def _cat2_temporal_candidates_from_block(
+        cls,
+        block: Dict[str, str],
+        question: str,
+    ) -> List[Dict[str, str]]:
+        """Build benchmark-style temporal candidates from one retrieved evidence block."""
+        session_dt = cls._parse_session_datetime(block.get("date", ""))
+        if session_dt is None:
+            return []
+
+        fields = cls._parse_memory_fields(block.get("content", ""))
+        fact_text = fields.get("content", block.get("content", ""))
+        text_lower = fact_text.lower()
+        question_lower = str(question or "").lower()
+        candidates: List[Dict[str, str]] = []
+
+        def add(raw: str, selected: str, answer_style: str, absolute: str = "") -> None:
+            if selected:
+                candidates.append({
+                    "raw_expression": raw,
+                    "selected_answer": selected,
+                    "answer_style": answer_style,
+                    "absolute_date": absolute,
+                    "session_date": cls._format_day(session_dt),
+                    "dia_id": fields.get("dia_id", ""),
+                    "raw_fact": fact_text[:400],
+                })
+
+        if "yesterday" in text_lower:
+            absolute_dt = session_dt - timedelta(days=1)
+            add("yesterday", cls._format_day(absolute_dt), "absolute_from_relative", cls._format_day(absolute_dt))
+
+        if "today" in text_lower:
+            add("today", cls._format_day(session_dt), "absolute_from_relative", cls._format_day(session_dt))
+
+        if "tomorrow" in text_lower:
+            absolute_dt = session_dt + timedelta(days=1)
+            add("tomorrow", cls._format_day(absolute_dt), "absolute_from_relative", cls._format_day(absolute_dt))
+
+        if (
+            "last weekend" in text_lower
+            or "the weekend before" in text_lower
+            or "previous weekend" in text_lower
+        ):
+            add("last weekend", f"The weekend before {cls._format_day(session_dt)}", "anchored_relative")
+
+        if re.search(r"\blast week\b", text_lower) or "the week before" in text_lower:
+            add("last week", f"The week before {cls._format_day(session_dt)}", "anchored_relative")
+
+        weekday_match = re.search(
+            r"last\s+(mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:rs(?:day)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\.?",
+            text_lower,
+        )
+        if weekday_match:
+            weekday = cls._canonical_weekday(weekday_match.group(1))
+            add(
+                f"last {weekday}",
+                f"The {weekday} before {cls._format_day(session_dt)}",
+                "anchored_relative",
+            )
+
+        if "last month" in text_lower:
+            year, month = cls._previous_month(session_dt)
+            add("last month", cls._format_month_year(year, month), "month_year")
+
+        if "next month" in text_lower:
+            year, month = cls._next_month(session_dt)
+            add("next month", cls._format_month_year(year, month), "month_year")
+
+        if "this month" in text_lower:
+            add("this month", cls._format_month_year(session_dt.year, session_dt.month), "month_year")
+
+        if "last year" in text_lower:
+            add("last year", str(session_dt.year - 1), "year")
+
+        since_match = re.search(r"\bsince\s+(\d{4})\b", text_lower)
+        if since_match:
+            add(since_match.group(0), f"Since {since_match.group(1)}", "duration_since")
+
+        duration_match = re.search(
+            r"\bfor\s+(a\s+few|a\s+couple|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+years?\b",
+            text_lower,
+        )
+        if duration_match:
+            amount = duration_match.group(1)
+            add(duration_match.group(0), f"{amount} years", "duration")
+
+        explicit_date_match = re.search(
+            r"\b(\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4})\b",
+            text_lower,
+        )
+        if explicit_date_match and "what date" in question_lower:
+            raw_date = explicit_date_match.group(1)
+            try:
+                explicit_dt = datetime.strptime(raw_date, "%d %B %Y")
+                add(raw_date, cls._format_day(explicit_dt), "explicit_absolute", cls._format_day(explicit_dt))
+            except ValueError:
+                pass
+
+        bare_year_match = re.search(r"\b(?:in|during)\s+(\d{4})\b", text_lower)
+        if bare_year_match and not candidates:
+            add(bare_year_match.group(0), bare_year_match.group(1), "year")
+
+        return candidates
+
+    @staticmethod
+    def _temporal_response_is_uncertain(response: str) -> bool:
+        response_lower = str(response or "").strip().lower()
+        return (
+            not response_lower
+            or "not mentioned" in response_lower
+            or "unknown" in response_lower
+            or response_lower in {"n/a", "none"}
+        )
+
+    def resolve_cat2_temporal_answer(
+        self,
+        response: str,
+        context: str,
+        question: str,
+    ) -> str:
+        """Prefer deterministic LoCoMo-style temporal candidates for Cat2."""
+        candidates: List[Dict[str, str]] = []
+        ranked_blocks = self._rank_temporal_blocks(context, question, response)
+        if not ranked_blocks:
+            ranked_blocks = self._parse_context_blocks(context)
+        for block in ranked_blocks:
+            candidates.extend(self._cat2_temporal_candidates_from_block(block, question))
+            if candidates:
+                break
+
+        if not candidates:
+            self.last_answer_debug["cat2_temporal_resolver_used"] = False
+            return self.normalize_temporal_answer(response, context, question)
+
+        selected = candidates[0]
+        resolved = selected["selected_answer"]
+        normalized_response = self.normalize_temporal_answer(response, context, question)
+        final_answer = resolved if self._temporal_response_is_uncertain(response) else normalized_response
+        if final_answer == response and selected.get("answer_style") in {
+            "anchored_relative", "duration_since", "duration", "year", "month_year",
+        }:
+            final_answer = resolved
+
+        self.last_answer_debug.update({
+            "cat2_temporal_resolver_used": True,
+            "cat2_temporal_selected": selected,
+            "cat2_temporal_candidate_count": len(candidates),
+            "cat2_temporal_initial_response": response,
+            "cat2_temporal_normalized_response": normalized_response,
+            "cat2_temporal_final_response": final_answer,
+        })
+        return final_answer
 
     @staticmethod
     def _mentions_session_date(response: str, session_dt: datetime) -> bool:
@@ -650,7 +827,10 @@ Short answer:"""
             logger.warning("answer_question failed: %s — returning empty", e)
             response = ""
         if answer_type == "temporal":
-            response = self.normalize_temporal_answer(response, raw_context, question)
+            if int(category) == 2:
+                response = self.resolve_cat2_temporal_answer(response, raw_context, question)
+            else:
+                response = self.normalize_temporal_answer(response, raw_context, question)
         if category == 1:
             response, rerank_prompt = self.refine_cat1_answer_with_evidence(
                 question, raw_context, response,
