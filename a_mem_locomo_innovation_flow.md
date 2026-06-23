@@ -1391,3 +1391,189 @@ Not-mentioned rate by question type
 ```
 
 If `same_storyline` improves evidence_hit_all but F1 does not improve, the remaining bottleneck is answer generation rather than graph retrieval.
+
+---
+
+## 14. v14 Diagnostic Patch: Category 2 Temporal Resolver
+
+### Motivation
+
+The v13 evidence-first run shows that Category 2 retrieval is already strong:
+
+```text
+category 2 evidence_hit_any: 77 / 90
+category 2 evidence_hit_all: 75 / 90
+category 2 LLM judge score: 0.600
+```
+
+This means many remaining Category 2 failures are not caused by missing evidence.
+They are caused by temporal answer realization:
+
+```text
+evidence is retrieved
+relative temporal expression is present
+the answer model outputs an empty answer, "Not mentioned", or the wrong anchored date
+```
+
+Therefore v14 adds a small deterministic temporal resolver as a diagnostic
+upper-bound experiment for Category 2 only.
+
+### Important Scope Note
+
+This patch intentionally uses `category == 2` as a temporary diagnostic gate.
+It should not be presented as the final inference-time design, because LoCoMo
+category labels are benchmark metadata.
+
+The intended final design is:
+
+```text
+question text
+  -> infer evidence requirement / question type
+  -> if temporal reasoning is required, use temporal resolver
+```
+
+The current Category 2 gate is used only to test whether temporal resolving is
+worth keeping before converting it into question-type-aware routing.
+
+### Implementation Location
+
+Implemented in:
+
+```text
+test_advanced_robust.py
+```
+
+Main functions:
+
+```text
+_cat2_temporal_candidates_from_block
+resolve_cat2_temporal_answer
+```
+
+Activation path:
+
+```python
+if answer_type == "temporal":
+    if int(category) == 2:
+        response = self.resolve_cat2_temporal_answer(response, raw_context, question)
+    else:
+        response = self.normalize_temporal_answer(response, raw_context, question)
+```
+
+This keeps Category 1, Category 4, and Category 5 behavior unchanged.
+
+### Candidate Generation
+
+For each high-ranked temporal evidence block, the resolver creates structured
+temporal candidates:
+
+```json
+{
+  "raw_expression": "last Saturday",
+  "selected_answer": "The Saturday before 25 May 2023",
+  "answer_style": "anchored_relative",
+  "absolute_date": "",
+  "session_date": "25 May 2023",
+  "dia_id": "D2:1",
+  "raw_fact": "..."
+}
+```
+
+Supported first-version patterns:
+
+```text
+yesterday / today / tomorrow
+last week / the week before
+last weekend / previous weekend / the weekend before
+last Monday ... last Sunday
+last month / this month / next month
+last year
+since YYYY
+for N years
+explicit date, when the question asks for a date
+bare year expressions such as "in 2022"
+```
+
+### Relative vs Absolute Date Policy
+
+The resolver stores both absolute and LoCoMo-style verbalizations when useful,
+but it usually returns benchmark-style anchored relative answers for weekday,
+week, and weekend expressions:
+
+```text
+last Saturday + session date 25 May 2023
+-> The Saturday before 25 May 2023
+```
+
+For expressions like `yesterday`, it returns the resolved absolute date:
+
+```text
+yesterday + session date 8 May 2023
+-> 7 May 2023
+```
+
+For duration expressions, it preserves duration form:
+
+```text
+since 2016 -> Since 2016
+for four years -> four years
+```
+
+### Answer Override Policy
+
+The resolver first lets the normal answer model generate an answer. Then:
+
+```text
+if the answer is empty, uncertain, or says "Not mentioned":
+    use the deterministic temporal candidate
+elif the old normalizer did not change the answer and the candidate is benchmark-style:
+    use the deterministic temporal candidate
+else:
+    keep the normalized model answer
+```
+
+This is meant to avoid over-overriding already-good answers while rescuing
+cases where evidence is available but the answer model fails to verbalize time.
+
+### Diagnostics Added
+
+Each resolved answer stores:
+
+```text
+cat2_temporal_resolver_used
+cat2_temporal_selected
+cat2_temporal_candidate_count
+cat2_temporal_initial_response
+cat2_temporal_normalized_response
+cat2_temporal_final_response
+```
+
+These fields should be inspected together with:
+
+```text
+retrieval_diagnostics.evidence_hit_all
+metrics.llm_judge_score
+```
+
+### Evaluation Plan
+
+Run a focused Category 2 experiment first:
+
+```text
+--categories 2
+```
+
+Compare against v13:
+
+```text
+category 2 F1
+category 2 EM
+category 2 LLM judge score
+all_hit_but_wrong count
+empty / Not-mentioned temporal answers
+temporal resolver used count
+```
+
+If the focused run improves Category 2 without obvious regressions in examples,
+the next version should replace the temporary `category == 2` gate with
+question-type-aware temporal routing.
