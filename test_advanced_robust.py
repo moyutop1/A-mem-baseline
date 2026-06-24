@@ -880,6 +880,11 @@ class LLMJudgeEvaluator:
                 }
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+        uppered = response.upper()
+        if re.search(r"\bCORRECT\b", uppered) and not re.search(r"\bWRONG\b", uppered):
+            return {"score": 1, "reason": response[:300], "raw_response": response}
+        if re.search(r"\bWRONG\b", uppered) and not re.search(r"\bCORRECT\b", uppered):
+            return {"score": 0, "reason": response[:300], "raw_response": response}
         lowered = response.lower()
         if re.search(r"\b(correct|yes|equivalent)\b", lowered) and not re.search(r"\bincorrect\b", lowered):
             return {"score": 1, "reason": response[:300], "raw_response": response}
@@ -894,23 +899,25 @@ class LLMJudgeEvaluator:
                 "judge_model": self.model,
                 "judge_backend": self.backend,
             }
-        prompt = f"""You are evaluating a short-answer QA system for the LoCoMo benchmark.
+        prompt = f"""Your task is to label an answer to a question as CORRECT or WRONG. You will be given the following data:
+    (1) a question posed by one user to another user,
+    (2) a gold ground-truth answer,
+    (3) a generated answer
+which you will score as CORRECT or WRONG.
 
-Question:
-{question}
+The point of the question is to ask about something one user should know about the other user based on their prior conversations.
+The gold answer will usually be concise and short. The generated answer might be much longer, but you should be generous with your grading: as long as it touches on the same topic and contains the same key answer as the gold answer, count it as CORRECT.
 
-Gold answer:
-{reference}
+For time-related questions, the gold answer will be a specific date, month, year, duration, or time period. The generated answer might be longer or use relative time references like "last Tuesday" or "next month". Be generous with your grading: as long as it refers to the same date or time period as the gold answer, count it as CORRECT. If the format differs, for example "May 7th" vs "7 May", count it as CORRECT if it is the same date.
 
-Predicted answer:
-{prediction}
+Mark WRONG if the generated answer misses the key answer, contradicts the gold answer, answers a different question, gives a different date or time period, or says the answer is not mentioned when the gold answer is present.
 
-Decide whether the predicted answer is semantically correct.
-Ignore minor wording, capitalization, punctuation, word order, and harmless extra words.
-Mark correct if the predicted answer contains the same key meaning as the gold answer.
-Mark incorrect if it misses the key answer, contradicts the gold answer, answers a different question, or says the answer is not mentioned when the gold answer is present.
+Now it is time for the real question:
+Question: {question}
+Gold answer: {reference}
+Generated answer: {prediction}
 
-Return JSON only:
+First decide whether the generated answer is CORRECT or WRONG. Return JSON only, using exactly one of these labels and a short one-sentence reason:
 {{"score": 1 or 0, "reason": "brief reason"}}"""
         try:
             response = self.controller.llm.get_completion(prompt, temperature=0.0)
