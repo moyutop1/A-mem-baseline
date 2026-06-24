@@ -1968,3 +1968,73 @@ answer_diagnostics.temporal_resolver_used
 retrieval_diagnostics.evidence_hit_all
 metrics.llm_judge_score
 ```
+
+### Follow-up Todo Tracking
+
+Open follow-up items are tracked in:
+
+```text
+a_mem_locomo_todo.md
+```
+
+The current deferred research item is summary/event nodes for graph support.
+This should be treated as an auxiliary routing idea, not as a replacement for
+raw evidence nodes and not as a reason to expand the persistent edge taxonomy.
+
+---
+
+## 17. v16 Repair: Profile Routing, Temporal Matching, and Short Evidence Prompt
+
+### Motivation
+
+The first v15 Cat1 micro-run showed that prompt shortening alone is not enough.
+The prompt became shorter, but many Cat1 questions were routed to `single_span`,
+which reduced evidence coverage:
+
+```text
+v13 Cat1 hit_all: 25/74
+v15 Cat1 hit_all: 17/74
+v13 Cat1 judge: 19/74
+v15 Cat1 judge: 9/74
+```
+
+The failure was mainly profile routing and evidence bundle exposure, not a need
+for more graph edge types.
+
+### Implemented Fixes
+
+The v16 repair implements the five active todos:
+
+1. temporal resolver now scores temporal candidates by event match instead of
+   choosing the first candidate;
+2. weak-inference instructions now explicitly prefer a likely conclusion when
+   retrieved evidence supports one;
+3. `infer_answer_type` no longer treats every `when` occurrence as temporal;
+4. `infer_evidence_need_profile` routes more multi-answer and attribute-bundle
+   questions into `multi_item_list`;
+5. the answer LLM now receives a compact structured evidence list instead of
+   the full raw retrieved context.
+
+### Short Evidence List
+
+The final answer prompt now uses:
+
+```text
+[Evidence i]
+dia_id:
+session_date:
+speaker:
+relation:
+fact:
+image_caption:
+image_query:
+matched_question_terms:
+```
+
+The raw context is still returned for retrieval diagnostics and post-processing.
+This keeps `hit_any` / `hit_all` comparable while reducing the answer prompt.
+
+### Scope Note
+
+This repair does not add graph edge types and does not implement summary/event
+nodes. The summary/event-node idea remains deferred in `a_mem_locomo_todo.md`.

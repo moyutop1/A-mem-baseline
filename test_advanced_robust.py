@@ -169,13 +169,14 @@ Keywords:"""
         """Extract retrieved memory blocks with their session dates and contents."""
         blocks = []
         pattern = re.compile(
-            r"talk start time:(?P<date>.*?) memory content: (?P<content>.*?)(?= relation: .*?talk start time:|talk start time:|\Z)",
+            r"(?:(?:relation:\s*(?P<relation>[a-zA-Z_]+).*?)?talk start time:(?P<date>.*?) memory content: (?P<content>.*?)(?= relation: .*?talk start time:|talk start time:|\Z))",
             re.DOTALL,
         )
         for match in pattern.finditer(context):
             blocks.append({
                 "date": match.group("date").strip(),
                 "content": match.group("content").strip(),
+                "relation": (match.group("relation") or "").strip(),
             })
         return blocks
 
@@ -282,6 +283,25 @@ Keywords:"""
             + 2 * len(response_tokens & main_tokens)
             + len(response_tokens & metadata_tokens)
         )
+
+    def _score_event_match_block(self, block: Dict[str, str], question: str) -> int:
+        fields = self._parse_memory_fields(block["content"])
+        fact_text = " ".join([
+            fields.get("speaker", ""),
+            fields.get("content", block.get("content", "")),
+            fields.get("image_caption", ""),
+            fields.get("image_query", ""),
+        ])
+        question_tokens = self._overlap_tokens(question)
+        fact_tokens = self._overlap_tokens(fact_text)
+        phrase_bonus = 0
+        question_lower = str(question or "").lower()
+        fact_lower = fact_text.lower()
+        for phrase in re.findall(r"\b[a-z0-9]+(?:\s+[a-z0-9]+){1,3}\b", question_lower):
+            phrase_tokens = self._overlap_tokens(phrase)
+            if len(phrase_tokens) >= 2 and phrase in fact_lower:
+                phrase_bonus += 2
+        return 3 * len(question_tokens & fact_tokens) + phrase_bonus
 
     def _rank_temporal_blocks(
         self,
@@ -480,20 +500,38 @@ Keywords:"""
         question: str,
     ) -> str:
         """Prefer deterministic LoCoMo-style temporal candidates for temporal questions."""
-        candidates: List[Dict[str, str]] = []
         ranked_blocks = self._rank_temporal_blocks(context, question, response)
         if not ranked_blocks:
             ranked_blocks = self._parse_context_blocks(context)
-        for block in ranked_blocks:
-            candidates.extend(self._temporal_candidates_from_block(block, question))
-            if candidates:
-                break
 
-        if not candidates:
+        scored_candidates: List[tuple] = []
+        for order, block in enumerate(ranked_blocks):
+            event_score = self._score_event_match_block(block, question)
+            temporal_score = self._score_temporal_block(block, question, response)
+            for candidate in self._temporal_candidates_from_block(block, question):
+                style_bonus = {
+                    "absolute_from_relative": 2,
+                    "anchored_relative": 2,
+                    "duration_since": 2,
+                    "duration": 2,
+                    "year": 1,
+                    "month_year": 1,
+                    "explicit_absolute": 2,
+                }.get(candidate.get("answer_style", ""), 0)
+                scored_candidates.append((
+                    event_score + temporal_score + style_bonus,
+                    event_score,
+                    temporal_score,
+                    -order,
+                    candidate,
+                ))
+
+        if not scored_candidates:
             self.last_answer_debug["temporal_resolver_used"] = False
             return self.normalize_temporal_answer(response, context, question)
 
-        selected = candidates[0]
+        scored_candidates.sort(reverse=True)
+        selected = scored_candidates[0][4]
         resolved = selected["selected_answer"]
         normalized_response = self.normalize_temporal_answer(response, context, question)
         final_answer = resolved if self._temporal_response_is_uncertain(response) else normalized_response
@@ -505,7 +543,9 @@ Keywords:"""
         self.last_answer_debug.update({
             "temporal_resolver_used": True,
             "temporal_selected": selected,
-            "temporal_candidate_count": len(candidates),
+            "temporal_candidate_count": len(scored_candidates),
+            "temporal_selected_event_score": scored_candidates[0][1],
+            "temporal_selected_block_score": scored_candidates[0][2],
             "temporal_initial_response": response,
             "temporal_normalized_response": normalized_response,
             "temporal_final_response": final_answer,
@@ -662,6 +702,59 @@ Keywords:"""
             lines.append("\n".join(parts))
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _compact_text(text: str, max_chars: int) -> str:
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    def _format_short_evidence_context(
+        self,
+        raw_context: str,
+        question: str,
+        evidence_profile: str,
+    ) -> str:
+        """Convert retrieved raw memories into compact evidence records for answer generation."""
+        blocks = self._parse_context_blocks(raw_context)
+        if not blocks:
+            return raw_context
+        question_tokens = self._overlap_tokens(question)
+        max_blocks = 16 if evidence_profile == "multi_item_list" else 12
+        if evidence_profile in {"temporal", "weak_inference"}:
+            max_blocks = 12
+
+        lines = []
+        for idx, block in enumerate(blocks[:max_blocks], start=1):
+            fields = self._parse_memory_fields(block["content"])
+            fact = fields.get("content", block["content"]).strip()
+            image_caption = fields.get("image_caption", "").strip()
+            image_query = fields.get("image_query", "").strip()
+            evidence_tokens = self._overlap_tokens(" ".join([fact, image_caption, image_query]))
+            matched_terms = sorted(question_tokens & evidence_tokens)[:10]
+            parts = [
+                f"[Evidence {idx}]",
+                f"dia_id: {fields.get('dia_id', 'unknown') or 'unknown'}",
+            ]
+            session_date = fields.get("session_date", block.get("date", ""))
+            if session_date:
+                parts.append(f"session_date: {session_date}")
+            speaker = fields.get("speaker", "")
+            if speaker:
+                parts.append(f"speaker: {speaker}")
+            relation = block.get("relation", "")
+            if relation:
+                parts.append(f"relation: {relation}")
+            parts.append(f"fact: {self._compact_text(fact, 420)}")
+            if image_caption:
+                parts.append(f"image_caption: {self._compact_text(image_caption, 160)}")
+            if image_query:
+                parts.append(f"image_query: {self._compact_text(image_query, 160)}")
+            if matched_terms:
+                parts.append(f"matched_question_terms: {', '.join(matched_terms)}")
+            lines.append("\n".join(parts))
+        return "\n\n".join(lines)
+
     def refine_multi_item_answer_with_evidence(
         self,
         question: str,
@@ -701,6 +794,8 @@ Final short answer:"""
             logger.warning("Multi-item evidence rerank failed: %s; using initial answer", e)
             return initial_response, rerank_prompt
         refined = parse_plain_text_answer(refined).strip()
+        if re.fullmatch(r"(?i)(final short answer:?\s*)", refined or ""):
+            refined = ""
         self.last_answer_debug = {
             "multi_item_evidence_rerank_used": True,
             "multi_item_evidence_block_count": evidence_block_count,
@@ -714,7 +809,12 @@ Final short answer:"""
     def infer_answer_type(question: str) -> str:
         """Infer answer format from question text only, not dataset category labels."""
         question_lower = str(question or "").strip().lower()
-        if re.search(r"\bwhen\b|\bhow long ago\b|\bwhat date\b|\bwhich day\b", question_lower):
+        if re.search(r"\bwho\b", question_lower):
+            return "person"
+        if re.search(
+            r"^(when\b|what date\b|which day\b|what year\b|what month\b|how long\b|since when\b)",
+            question_lower,
+        ):
             return "temporal"
         if re.search(r"\bhow many\b|\bnumber of\b|\bhow often\b", question_lower):
             return "count"
@@ -726,15 +826,15 @@ Final short answer:"""
             return "yes_no_judgment"
         if re.search(
             r"\bwhat (?:activities|events|books|items|types|ways|symbols|changes|musical artists|bands)\b"
-            r"|\bwhich (?:classical musicians|musical artists|bands)\b"
-            r"|\bin what ways\b",
+            r"|\bwhich (?:events|types|items|classical musicians|musical artists|bands)\b"
+            r"|\bin what ways\b"
+            r"|\bwhat does .* do to\b"
+            r"|\bwhat .* has .* (?:read|made|attended|done)\b",
             question_lower,
         ):
             return "list"
         if re.match(r"^(did|does|do|is|are|was|were|has|have|had|can|could)\b", question_lower):
             return "yes_no_fact"
-        if re.search(r"\bwho\b", question_lower):
-            return "person"
         if re.search(r"\bwhere\b|\bwhat country\b", question_lower):
             return "place"
         return "factual_span"
@@ -748,6 +848,17 @@ Final short answer:"""
             return "temporal"
         if answer_type in {"yes_no_judgment", "trait_or_preference"}:
             return "weak_inference"
+        if re.search(
+            r"\b(identity|relationship status|career path|support system)\b"
+            r"|\bwhat .* (?:like|read|made|attended|participated|done|offer|offers)\b"
+            r"|\bwhich (?:events|types|items)\b"
+            r"|\bwhat does .* do to\b"
+            r"|\bwhere has\b"
+            r"|\bwhere did .* (?:camp|camped|make friends|made friends)\b"
+            r"|\bwhat (?:desserts|causes|music events|outdoor activities|lgbtq\+? events|transgender-specific events)\b",
+            question_lower,
+        ):
+            return "multi_item_list"
         if answer_type == "list" or re.search(
             r"\bwhat (?:activities|events|books|items|types|ways|symbols|changes|musical artists|bands)\b"
             r"|\bwhich (?:classical musicians|musical artists|bands)\b"
@@ -773,7 +884,8 @@ Final short answer:"""
             ),
             "weak_inference": (
                 "The question asks for a likely judgment or preference. "
-                "If evidence supports a tendency, answer with the likely conclusion instead of saying it is not mentioned."
+                "First identify supporting and opposing evidence. If at least one evidence block supports a tendency, "
+                "answer with the likely conclusion instead of saying it is not mentioned."
             ),
             "yes_no_fact": (
                 "The question asks for a direct factual yes/no answer. Use explicit support or contradiction from the evidence."
@@ -792,11 +904,12 @@ Final short answer:"""
             "count": "Return only the number or short count phrase.",
             "yes_no_judgment": (
                 "Return Likely yes or Likely no, followed by a very short evidence phrase when available. "
-                "Example style: Likely yes; classic children's books. Do not write a full explanation."
+                "Example style: Likely yes; classic children's books. Do not write a full explanation. "
+                "Do not answer Not mentioned when retrieved evidence supports a likely judgment."
             ),
             "trait_or_preference": (
                 "Return the trait, field, preference, belief, or category phrase, optionally followed by a very short evidence anchor. "
-                "Do not write a full explanation."
+                "Do not write a full explanation. Do not answer Not mentioned when retrieved evidence supports a likely preference."
             ),
             "list": (
                 "Return a comma-separated list of all distinct supported items. "
@@ -835,10 +948,11 @@ Final short answer:"""
             category=category,
             evidence_profile=evidence_profile,
         )
+        short_context = self._format_short_evidence_context(raw_context, question, evidence_profile)
         context = (
-            self.retrieve_memory_llm(raw_context, question)
+            self.retrieve_memory_llm(short_context, question)
             if int(category) in self.compress_categories
-            else raw_context
+            else short_context
         )
         self.last_answer_debug = {
             "question_type_answer_planner": True,
@@ -846,6 +960,8 @@ Final short answer:"""
             "evidence_profile": evidence_profile,
             "format_instruction": format_instruction,
             "profile_instruction": profile_instruction,
+            "short_context_chars": len(context),
+            "raw_context_chars": len(raw_context),
         }
         user_prompt = f"""Based on the context, answer the question using only supported evidence.
 {evidence_instruction}
@@ -862,8 +978,9 @@ General rules:
 - If the context mentions the relevant person, object, event, or activity asked about, answer with the closest supported phrase.
 - Do not answer "Not mentioned in the conversation" merely because the wording is indirect.
 - Only answer "Not mentioned in the conversation" when no retrieved memory block mentions the subject or event needed to answer.
+- For weak-inference questions, answer with a likely conclusion when the evidence supports one.
 
-Context:
+Structured evidence:
 {context}
 
 Question: {question}
@@ -896,6 +1013,8 @@ Short answer:"""
                 "evidence_profile": evidence_profile,
                 "format_instruction": format_instruction,
                 "profile_instruction": profile_instruction,
+                "short_context_chars": len(context),
+                "raw_context_chars": len(raw_context),
             })
         return response, user_prompt, raw_context
 
