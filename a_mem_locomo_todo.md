@@ -16,9 +16,31 @@ diagnostic experiments.
 
 ## Active Next-Step Todos
 
+### Current Active Version: v17_v13_prompt_guard
+
+Status: active experiment
+
+Reason:
+
+The v16 implementation of profile routing and global short evidence prompts
+caused a clear Cat1 regression in the micro-run. The current active code is
+therefore restored to the stable v13-style baseline and keeps only conservative
+answer-side guards:
+
+```text
+stronger Not mentioned instruction
+Cat1 rerank fallback when the reranker erases a supported initial answer
+```
+
+The five v16 todos below should be treated as implemented once but rolled back
+from the active code path until a new diagnostic shows which parts can be
+reintroduced without hurting Cat1.
+
+---
+
 ### 1. Temporal Resolver: Event-Matched Candidate Selection
 
-Status: implemented, needs experiment validation
+Status: rolled back from active v17 code, keep as future candidate
 
 Reason:
 
@@ -51,7 +73,7 @@ must not become another hand-tuned category rule.
 
 ### 2. Weak-Inference Answer Realization
 
-Status: implemented, needs experiment validation
+Status: partly covered by v17 prompt guard, full structured version rolled back
 
 Reason:
 
@@ -83,7 +105,7 @@ judgments without hallucinating unsupported preferences.
 
 ### 3. Fix `infer_answer_type`
 
-Status: implemented, needs experiment validation
+Status: rolled back from active v17 code, keep as future candidate
 
 Reason:
 
@@ -115,7 +137,7 @@ Low. This is a clear bug fix.
 
 ### 4. Fix `infer_evidence_need_profile`
 
-Status: implemented, needs experiment validation
+Status: rolled back from active v17 code, keep as future candidate
 
 Reason:
 
@@ -150,7 +172,7 @@ larger evidence bundle, increasing noise.
 
 ### 5. Short Evidence List Before LLM Answering
 
-Status: implemented, needs experiment validation
+Status: rolled back from active v17 code, keep as future candidate
 
 Reason:
 

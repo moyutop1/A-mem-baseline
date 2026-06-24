@@ -2038,3 +2038,79 @@ This keeps `hit_any` / `hit_all` comparable while reducing the answer prompt.
 
 This repair does not add graph edge types and does not implement summary/event
 nodes. The summary/event-node idea remains deferred in `a_mem_locomo_todo.md`.
+
+---
+
+## 18. v17 Restore: v13 Baseline with Conservative Answer Guards
+
+### Motivation
+
+The v16-style profile routing and short evidence prompt were too broad for the
+next stable experiment. The Cat1 micro-run regressed sharply, while Cat2 only
+improved slightly. The next step therefore restores the code path to the
+pre-v15/v16 stable baseline, then applies only two conservative answer-side
+guards:
+
+```text
+restore stable v13-style retrieval / answer pipeline
+  -> strengthen Not mentioned instruction
+  -> prevent Cat1 evidence rerank from erasing a supported initial answer
+```
+
+This keeps the experiment focused on whether the high `Not mentioned` rate is
+mainly an answer-realization problem rather than a retrieval/profile rewrite
+problem.
+
+### Restored Scope
+
+The active code is restored from the stable pre-v15/v16 line identified in git
+history. This means the following v16 changes are not active in v17:
+
+```text
+general evidence_profile routing
+short evidence list for every category
+event-matched general temporal resolver
+multi-item profile rename / routing rewrite
+```
+
+The old Cat1 evidence rerank and old Cat2 temporal resolver remain, matching the
+stable baseline more closely.
+
+### v17 Additions
+
+The main answer prompt now says:
+
+```text
+partial evidence -> answer the supported part
+list questions -> include all supported items
+weak judgment / likely questions -> give the best supported conclusion
+Not mentioned -> only when no retrieved block mentions the needed subject/event
+```
+
+The Cat1 evidence rerank prompt now also forbids empty answers and forbids
+returning `Not mentioned in the conversation` when structured evidence mentions
+the requested subject/event/item.
+
+### Rerank Safety Guard
+
+After the Cat1 rerank LLM returns, v17 rejects outputs that are only labels,
+empty strings, or `Not mentioned` replacements when:
+
+```text
+structured evidence exists
+and the initial answer was non-empty
+```
+
+In those cases the system falls back to the initial answer and records:
+
+```text
+answer_diagnostics.cat1_rerank_fallback_to_initial = true
+```
+
+### Version Tag
+
+Use this experiment label for result files:
+
+```text
+v17_v13_prompt_guard
+```
