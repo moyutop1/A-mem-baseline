@@ -18,7 +18,7 @@ diagnostic experiments.
 
 ### Current Active Version: v17_v13_prompt_guard
 
-Status: active experiment
+Status: superseded by v18_rewrite_memory_top10
 
 Reason:
 
@@ -35,6 +35,33 @@ Cat1 rerank fallback when the reranker erases a supported initial answer
 The five v16 todos below should be treated as implemented once but rolled back
 from the active code path until a new diagnostic shows which parts can be
 reintroduced without hurting Cat1.
+
+---
+
+### Current Active Version: v18_rewrite_memory_top10
+
+Status: active experiment
+
+Reason:
+
+The v17 Cat1/Cat2 results show that answer refusal is no longer the main issue.
+The main problem is evidence ranking: Cat1 often hits part of the gold evidence
+but fails to rank the full evidence set into the final context.
+
+Implemented repair:
+
+```text
+raw dialogue turn
+  -> LLM rewrite_content as a self-contained evidence sentence
+  -> retrieval, lexical scoring, Cat1 coverage rerank, and graph construction use rewrite_content
+  -> final answer prompt still uses original raw memory sentence
+  -> final context is capped at top 10 evidence blocks
+```
+
+Important constraint:
+
+Do not add new graph edge types for this iteration. The purpose is to test
+whether better node text improves ranking without expanding the edge taxonomy.
 
 ---
 

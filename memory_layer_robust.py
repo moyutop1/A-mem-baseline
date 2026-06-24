@@ -155,18 +155,37 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v6_evidence_first_no_domain_filter"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v6_evidence_first_storyline_edges"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v7_rewrite_memory_index"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v7_rewrite_memory_edges"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
 DEFAULT_GLOBAL_BM25_TOP_K = 15
 DEFAULT_GLOBAL_ENTITY_TOP_K = 10
 DEFAULT_FINAL_BUNDLE_SIZE = 6
-DEFAULT_FINAL_BUNDLE_MAX_SIZE = 8
-DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 16
-DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 16
+DEFAULT_FINAL_BUNDLE_MAX_SIZE = 10
+DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 10
+DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 10
 DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K = 40
+
+REWRITE_MEMORY_PROMPT = """Rewrite one LoCoMo memory into a retrieval-oriented evidence sentence.
+
+Raw memory:
+{content}
+
+Return JSON only:
+{{
+  "rewrite_content": "one self-contained evidence sentence"
+}}
+
+Requirements:
+- Resolve pronouns using the speaker and content when possible.
+- Preserve concrete names, activities, objects, places, dates, and visual evidence.
+- Anchor relative time with the session date when it is available, while keeping the original relative cue if useful.
+- Include image_caption or image_query facts when they contain answer-bearing evidence.
+- Do not add facts not supported by the raw memory.
+- Keep it concise, preferably under 55 words.
+"""
 
 UNCERTAIN_MARKERS = {
     "maybe", "might", "possibly", "probably", "not sure", "uncertain",
@@ -430,6 +449,7 @@ class RobustMemoryNote:
     def __init__(self,
                  content: str,
                  current_content: Optional[str] = None,
+                 rewrite_content: Optional[str] = None,
                  id: Optional[str] = None,
                  keywords: Optional[List[str]] = None,
                  links: Optional[List[Any]] = None,
@@ -460,6 +480,7 @@ class RobustMemoryNote:
 
         self.content = current_content or content
         self.current_content = self.content
+        self.rewrite_content = rewrite_content or ""
 
         if llm_controller and any(p is None for p in [keywords, context, category, tags]):
             analysis = self.analyze_content(content, llm_controller)
@@ -606,6 +627,60 @@ class RobustAgenticMemorySystem:
         return fields
 
     @staticmethod
+    def _raw_memory_content(memory: RobustMemoryNote) -> str:
+        return str(getattr(memory, "current_content", getattr(memory, "content", "")) or "")
+
+    def _deterministic_rewrite_content(self, memory: RobustMemoryNote) -> str:
+        raw = self._raw_memory_content(memory)
+        fields = self._parse_memory_fields(raw)
+        speaker = fields.get("speaker", "").strip()
+        session_date = fields.get("session_date", "").strip()
+        content = fields.get("content", raw).strip()
+        image_caption = fields.get("image_caption", "").strip()
+        image_query = fields.get("image_query", "").strip()
+        pieces = []
+        if speaker:
+            pieces.append(f"{speaker} said: {content}")
+        else:
+            pieces.append(content)
+        if session_date:
+            pieces.append(f"Session date: {session_date}.")
+        if image_caption:
+            pieces.append(f"Image caption: {image_caption}.")
+        if image_query:
+            pieces.append(f"Image query: {image_query}.")
+        return re.sub(r"\s+", " ", " ".join(piece for piece in pieces if piece)).strip()
+
+    def _rewrite_memory_content(self, memory: RobustMemoryNote) -> str:
+        raw = self._raw_memory_content(memory)
+        if not raw:
+            return ""
+        try:
+            prompt = REWRITE_MEMORY_PROMPT.format(content=raw)
+            response = self.llm_controller.llm.get_completion(prompt, temperature=0.1)
+            payload = self._parse_json_payload(response)
+            rewritten = str(payload.get("rewrite_content", "")).strip()
+            if rewritten:
+                return re.sub(r"\s+", " ", rewritten).strip()
+        except Exception as e:
+            logger.warning("Rewrite memory LLM failed for note %s: %s; using fallback rewrite",
+                           getattr(memory, "id", "unknown"), e)
+        return self._deterministic_rewrite_content(memory)
+
+    def _ensure_rewrite_content(self, memory: RobustMemoryNote) -> None:
+        rewrite = str(getattr(memory, "rewrite_content", "") or "").strip()
+        if rewrite:
+            memory.rewrite_content = re.sub(r"\s+", " ", rewrite).strip()
+            return
+        memory.rewrite_content = self._rewrite_memory_content(memory)
+
+    def _retrieval_memory_text(self, memory: RobustMemoryNote) -> str:
+        rewrite = str(getattr(memory, "rewrite_content", "") or "").strip()
+        if rewrite:
+            return rewrite
+        return self._deterministic_rewrite_content(memory)
+
+    @staticmethod
     def _canonical_token(token: str) -> str:
         token = token.lower()
         if len(token) > 5 and token.endswith("ing"):
@@ -678,10 +753,10 @@ class RobustAgenticMemorySystem:
         return f"{query_text} ; evidence cues: {' '.join(expansions)}"
 
     def _lexical_relevance(self, memory: RobustMemoryNote, query: str) -> float:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         main_text = " ".join([
             fields.get("speaker", ""),
-            fields.get("content", getattr(memory, "current_content", memory.content)),
+            self._retrieval_memory_text(memory),
             " ".join(getattr(memory, "keywords", [])),
             " ".join(getattr(memory, "tags", [])),
         ])
@@ -718,7 +793,7 @@ class RobustAgenticMemorySystem:
             dia_id = condition.get("dia_id") if isinstance(condition, dict) else None
             if dia_id and self._dia_sort_key(str(dia_id)):
                 return str(dia_id)
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         dia_id = fields.get("dia_id")
         return dia_id if dia_id and self._dia_sort_key(dia_id) else None
 
@@ -791,12 +866,12 @@ class RobustAgenticMemorySystem:
         return list(self._domain_catalog().keys())
 
     def _memory_brief(self, memory: RobustMemoryNote, max_chars: int = 220) -> str:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         pieces = [
             fields.get("dia_id", ""),
             fields.get("session_date", ""),
             fields.get("speaker", ""),
-            fields.get("content", getattr(memory, "current_content", memory.content)),
+            self._retrieval_memory_text(memory),
         ]
         brief = " | ".join(piece for piece in pieces if piece)
         return brief[:max_chars]
@@ -1029,8 +1104,8 @@ Rules:
         return annotations
 
     def _detect_temporal_expressions(self, memory: RobustMemoryNote) -> List[Dict[str, Any]]:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
-        text = fields.get("content", getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
+        text = self._retrieval_memory_text(memory)
         session_date = fields.get("session_date", "")
         temporal_markers = [
             "yesterday", "today", "tomorrow", "last week", "next week", "last month",
@@ -1076,18 +1151,18 @@ Rules:
             ]
 
     def _event_text(self, memory: RobustMemoryNote) -> str:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         return " ".join([
             fields.get("speaker", ""),
-            fields.get("content", getattr(memory, "current_content", memory.content)),
+            self._retrieval_memory_text(memory),
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
         ]).strip()
 
     def _typed_edge_profile(self, memory: RobustMemoryNote) -> Dict[str, Any]:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         speaker = fields.get("speaker", "").strip()
-        content = fields.get("content", getattr(memory, "current_content", memory.content))
+        content = self._retrieval_memory_text(memory)
         image_caption = fields.get("image_caption", "")
         image_query = fields.get("image_query", "")
         keyword_text = " ; ".join(str(item) for item in getattr(memory, "keywords", []) or [])
@@ -1276,7 +1351,7 @@ Rules:
         return bool(left_domains & right_domains)
 
     def _speaker_for_memory(self, memory: RobustMemoryNote) -> str:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         return fields.get("speaker", "").strip()
 
     def _build_offline_graph_edges(self) -> None:
@@ -1643,9 +1718,9 @@ Rules:
             if idx >= len(all_memories):
                 continue
             memory = self._ensure_memory_schema(all_memories[idx])
-            fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+            fields = self._parse_memory_fields(self._raw_memory_content(memory))
             speaker = fields.get("speaker", "")
-            content = fields.get("content", getattr(memory, "current_content", memory.content))
+            content = self._retrieval_memory_text(memory)
             exact_text = " ".join([
                 speaker,
                 content,
@@ -1958,9 +2033,9 @@ Rules:
 
     def _category1_slot_tokens(self, memory: RobustMemoryNote, query: str) -> Set[str]:
         """Tokens that can add complementary Cat1 evidence beyond the query wording."""
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         evidence_text = " ".join([
-            fields.get("content", getattr(memory, "current_content", memory.content)),
+            self._retrieval_memory_text(memory),
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
             " ".join(getattr(memory, "keywords", [])),
@@ -2045,10 +2120,10 @@ Rules:
         query: str,
         profile: Dict[str, Any],
     ) -> Dict[str, Any]:
-        fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
+        fields = self._parse_memory_fields(self._raw_memory_content(memory))
         evidence_text = " ".join([
             fields.get("speaker", ""),
-            fields.get("content", getattr(memory, "current_content", memory.content)),
+            self._retrieval_memory_text(memory),
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
             " ".join(getattr(memory, "keywords", [])),
@@ -2222,9 +2297,10 @@ Rules:
 
     def _memory_to_index_text(self, memory: RobustMemoryNote) -> str:
         """Build a weighted retriever document from the current valid memory object."""
-        current_content = getattr(memory, "current_content", memory.content)
-        fields = self._parse_memory_fields(current_content)
-        main_content = fields.get("content", current_content)
+        self._ensure_rewrite_content(memory)
+        raw_content = self._raw_memory_content(memory)
+        fields = self._parse_memory_fields(raw_content)
+        main_content = self._retrieval_memory_text(memory)
         visual_cues = " ".join([
             fields.get("image_caption", ""),
             fields.get("image_query", ""),
@@ -2237,9 +2313,9 @@ Rules:
             " ".join(getattr(memory, "tags", [])),
         ]).strip()
         pieces = [
-            "content: " + main_content,
-            "content: " + main_content,
-            "content: " + main_content,
+            "rewrite_content: " + main_content,
+            "rewrite_content: " + main_content,
+            "rewrite_content: " + main_content,
             "metadata: " + metadata,
             "status: " + getattr(memory, "status", "active"),
         ]
@@ -2271,7 +2347,7 @@ Rules:
                     entry = catalog.setdefault(path, {"count": 0, "examples": []})
                     entry["count"] += 1
                     if len(entry["examples"]) < 3:
-                        entry["examples"].append(getattr(memory, "current_content", memory.content))
+                        entry["examples"].append(self._retrieval_memory_text(memory))
         return catalog
 
     def _cosine_similarity(self, left: Any, right: Any) -> float:
@@ -2445,6 +2521,9 @@ Rules:
             memory.failed_citation_count = 0
         if not hasattr(memory, "last_updated"):
             memory.last_updated = getattr(memory, "last_accessed", getattr(memory, "timestamp", ""))
+        if not hasattr(memory, "rewrite_content"):
+            memory.rewrite_content = ""
+        self._ensure_rewrite_content(memory)
         return memory
 
     def _format_memory_for_context(
@@ -2502,8 +2581,9 @@ Rules:
             timestamp=time,
             **kwargs,
         )
+        self._ensure_memory_schema(note)
         if not provided_domain_paths:
-            note.domain_paths = self.route_domains(note.current_content, note=note)
+            note.domain_paths = self.route_domains(self._retrieval_memory_text(note), note=note)
         if getattr(note, "memory_level", DEFAULT_MEMORY_LEVEL) == "instance" and provided_domain_paths:
             self.memories[note.id] = note
             self.retriever.add_documents([self._memory_to_index_text(note)])
@@ -2774,7 +2854,7 @@ Rules:
     def retrieve_same_entity_or_topic(self, new_memory: RobustMemoryNote, top_k: int = 10) -> tuple:
         """Retrieve candidate memories likely to share an entity, topic, or semantic scope."""
         query = " ".join([
-            new_memory.current_content,
+            self._retrieval_memory_text(new_memory),
             new_memory.context,
             " ".join(new_memory.keywords),
             " ".join(new_memory.tags),
@@ -2800,7 +2880,7 @@ Rules:
 
         try:
             prompt = MEMORY_RELATION_RESOLUTION_PROMPT.format(
-                content=new_memory.current_content,
+                content=self._retrieval_memory_text(new_memory),
                 context=new_memory.context,
                 keywords=new_memory.keywords,
                 tags=new_memory.tags,
@@ -2857,7 +2937,7 @@ Rules:
     ) -> Dict[str, Any]:
         """Deterministic fallback when relation-resolution LLM output is unavailable."""
         best_index, best_overlap = self._best_candidate_overlap(new_memory, candidate_indices)
-        content_lower = new_memory.current_content.lower()
+        content_lower = self._retrieval_memory_text(new_memory).lower()
 
         if any(marker in content_lower for marker in UNCERTAIN_MARKERS):
             return {
@@ -2931,7 +3011,7 @@ Rules:
 
     def _memory_token_set(self, memory: RobustMemoryNote) -> set:
         text = " ".join([
-            getattr(memory, "current_content", memory.content),
+            self._retrieval_memory_text(memory),
             getattr(memory, "context", ""),
             " ".join(getattr(memory, "keywords", [])),
             " ".join(getattr(memory, "tags", [])),
@@ -2951,7 +3031,7 @@ Rules:
         if target_index >= len(all_memories):
             return False
         old_memory = self._ensure_memory_schema(all_memories[target_index])
-        combined = f"{old_memory.current_content} {new_memory.current_content}".lower()
+        combined = f"{self._retrieval_memory_text(old_memory)} {self._retrieval_memory_text(new_memory)}".lower()
         condition_terms = {
             "prefer", "prefers", "preference", "likes", "wants", "interview",
             "essay", "academic", "when", "while", "context", "under",
@@ -2992,6 +3072,7 @@ Rules:
         )["content"]
         old_memory.content = content
         old_memory.current_content = content
+        old_memory.rewrite_content = self._rewrite_memory_content(old_memory)
         old_memory.context = new_memory.context or old_memory.context
         old_memory.keywords = self._merge_unique(old_memory.keywords, new_memory.keywords)
         old_memory.tags = self._merge_unique(old_memory.tags, new_memory.tags)

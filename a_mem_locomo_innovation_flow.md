@@ -2114,3 +2114,106 @@ Use this experiment label for result files:
 ```text
 v17_v13_prompt_guard
 ```
+
+---
+
+## 19. v18 Rewrite Memory: Retrieval-Oriented Evidence Normalization
+
+### Motivation
+
+The v17 Cat1/Cat2 run showed that the remaining bottleneck is retrieval
+ranking, not answer refusal. Cat1 especially has high `hit_any` but low
+`hit_all`, which means the system often finds part of the answer evidence but
+does not rank the full evidence set into the final context.
+
+The suspected cause is that raw dialogue turns are too weak as retrieval
+objects:
+
+```text
+pronouns and ellipsis
+relative time expressions
+chatty filler words
+answer facts split across dialogue wording
+image facts separated from text facts
+```
+
+### Implemented Change
+
+v18 adds `rewrite_content` to every `RobustMemoryNote`.
+
+The rewrite is an LLM-generated, self-contained evidence sentence. It resolves
+pronouns, preserves names/activities/objects/places/dates, anchors relative
+time when possible, and keeps image facts when they are answer-bearing.
+
+No `rewrite_summary` field is added. The single retrieval representation is:
+
+```text
+rewrite_content
+keywords
+tags
+visual cue: image_caption + image_query
+metadata: dia_id + session_date + speaker
+```
+
+### Where Rewrite Is Used
+
+The following stages now use `rewrite_content` instead of raw dialogue content:
+
+```text
+embedding index text
+BM25 document text
+lexical relevance
+exact/entity overlap ranking
+Cat1 slot-token coverage rerank
+offline domain annotation brief
+offline graph event text
+typed graph edge profile
+write-time same-entity/topic retrieval
+```
+
+Graph edge types are unchanged:
+
+```text
+same_storyline
+similar_event
+same_character
+image_text_pair
+```
+
+This keeps the innovation on memory representation quality rather than adding a
+larger edge taxonomy.
+
+### Final Answer Context
+
+The final answer still uses the original raw memory sentence for evidence
+faithfulness and compatibility with existing LoCoMo diagnostics. The final
+context size is reduced to top 10 evidence blocks:
+
+```text
+DEFAULT_FINAL_BUNDLE_MAX_SIZE = 10
+DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 10
+DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 10
+```
+
+This tests whether rewrite-based ranking can move the right raw evidence into a
+smaller final prompt, instead of relying on 16-block Cat1 admission.
+
+### Cache Note
+
+The retriever and domain-graph cache versions are bumped:
+
+```text
+robust_retrieval_v7_rewrite_memory_index
+domain_graph_v7_rewrite_memory_edges
+```
+
+Old pickled memories are backfilled with `rewrite_content` on load, then saved
+again after graph preparation.
+
+### Version Tag
+
+Use this experiment label for result files:
+
+```text
+v18_rewrite_memory_top10
+```
