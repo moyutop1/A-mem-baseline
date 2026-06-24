@@ -635,8 +635,8 @@ class RobustAgenticMemorySystem:
         }
 
     @staticmethod
-    def _category1_query_expansion(query: str) -> str:
-        """Add conservative evidence cues for Cat1 multi-evidence retrieval."""
+    def _multi_item_query_expansion(query: str) -> str:
+        """Add conservative evidence cues for multi-item evidence retrieval."""
         query_text = str(query or "")
         query_lower = query_text.lower()
         expansions: List[str] = []
@@ -1681,6 +1681,7 @@ Rules:
         k: int,
         routed_domains: Optional[List[str]],
         category: Optional[int] = None,
+        evidence_profile: Optional[str] = None,
     ) -> List[tuple]:
         all_memories = list(self.memories.values())
         if not all_memories:
@@ -1689,7 +1690,11 @@ Rules:
             category_int = int(category) if category is not None else None
         except (TypeError, ValueError):
             category_int = None
-        lexical_query = self._category1_query_expansion(query) if category_int == 1 else query
+        evidence_profile = str(evidence_profile or "").strip().lower()
+        multi_item_mode = evidence_profile == "multi_item_list" or (
+            not evidence_profile and category_int == 1
+        )
+        lexical_query = self._multi_item_query_expansion(query) if multi_item_mode else query
 
         candidate_indices = []
         fallback_indices = []
@@ -1706,7 +1711,7 @@ Rules:
         candidate_indices = fallback_indices
 
         domain_top_k = max(self.domain_seed_top_k, k * 4)
-        if category_int == 1:
+        if multi_item_mode:
             domain_top_k = max(domain_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
         embedding_ranked = self._embedding_rank_indices(query, candidate_indices, domain_top_k)
         bm25_ranked = self._bm25_rank_indices(lexical_query, candidate_indices, domain_top_k)
@@ -1756,7 +1761,7 @@ Rules:
             global_embedding_top_k = self.global_fallback_top_k
             global_bm25_top_k = self.global_bm25_top_k
             global_entity_top_k = self.global_entity_top_k
-            if category_int == 1:
+            if multi_item_mode:
                 global_embedding_top_k = max(global_embedding_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
                 global_bm25_top_k = max(global_bm25_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
                 global_entity_top_k = max(global_entity_top_k, DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K)
@@ -1788,16 +1793,11 @@ Rules:
             "image_text_pair": 0.55,
             "same_character": 0.45,
         }
-        if category_int == 1:
+        if multi_item_mode:
             allowed_graph_relations = {
                 "same_storyline", "similar_event", "same_character", "image_text_pair",
             }
             seed_limit, per_seed_limit, graph_candidate_limit = 20, 3, 36
-        elif category_int == 2:
-            allowed_graph_relations = {
-                "same_storyline", "similar_event", "same_character", "image_text_pair",
-            }
-            seed_limit, per_seed_limit, graph_candidate_limit = 10, 2, 16
         elif category_int == 4:
             allowed_graph_relations = {
                 "same_storyline", "image_text_pair", "similar_event",
@@ -1849,8 +1849,6 @@ Rules:
                 lexical = self._lexical_relevance(target_memory, lexical_query)
                 if category_int == 4 and lexical < 1.0:
                     continue
-                if category_int == 2 and relation not in {"same_storyline", "image_text_pair"} and lexical < 1.0:
-                    continue
                 strength = float(edge.get("strength", 0.5))
                 relation_weight = relation_weights.get(relation, 0.4)
                 graph_score = seed_score * strength * relation_weight * (1.0 + min(1.0, lexical / 8.0))
@@ -1895,7 +1893,7 @@ Rules:
                     "domain_match": 0.05,
                     "lexical": 0.20,
                 }
-            elif category_int == 1:
+            elif multi_item_mode:
                 weights = {
                     "domain_embedding": 0.18,
                     "domain_bm25": 0.18,
@@ -1921,7 +1919,7 @@ Rules:
                 }
             session_bonus = 0.0
             dia_key = self._dia_sort_key(self._dia_id_for_memory(memory) or "")
-            if category_int == 1 and dia_key:
+            if multi_item_mode and dia_key:
                 # Small diversity bonus during ordering so multi-hop candidates do not all come from one session.
                 session_bonus = max(0.0, 0.04 - 0.02 * session_counts.get(dia_key[0], 0))
             combined_score = (
@@ -1956,8 +1954,8 @@ Rules:
         ]
         return ranked
 
-    def _category1_slot_tokens(self, memory: RobustMemoryNote, query: str) -> Set[str]:
-        """Tokens that can add complementary Cat1 evidence beyond the query wording."""
+    def _multi_item_slot_tokens(self, memory: RobustMemoryNote, query: str) -> Set[str]:
+        """Tokens that can add complementary evidence beyond the query wording."""
         fields = self._parse_memory_fields(getattr(memory, "current_content", memory.content))
         evidence_text = " ".join([
             fields.get("content", getattr(memory, "current_content", memory.content)),
@@ -1975,8 +1973,8 @@ Rules:
         return {token for token in tokens if token not in generic_tokens}
 
     @staticmethod
-    def _category1_slot_profile(query: str) -> Dict[str, Any]:
-        """Infer the answer slot Cat1 is asking for from stable question wording."""
+    def _multi_item_slot_profile(query: str) -> Dict[str, Any]:
+        """Infer the answer slot a multi-item question is asking for."""
         query_lower = str(query or "").lower()
         slot_type = "fact"
         cue_terms: Set[str] = set()
@@ -2039,7 +2037,7 @@ Rules:
             "target_terms": target_terms,
         }
 
-    def _category1_slot_signal(
+    def _multi_item_slot_signal(
         self,
         memory: RobustMemoryNote,
         query: str,
@@ -2055,7 +2053,7 @@ Rules:
         ])
         evidence_lower = evidence_text.lower()
         evidence_tokens = self._retrieval_tokens(evidence_text)
-        slot_tokens = self._category1_slot_tokens(memory, query)
+        slot_tokens = self._multi_item_slot_tokens(memory, query)
         cue_terms = set(profile.get("cue_terms", set()))
         target_terms = set(profile.get("target_terms", set()))
         cue_hits = {term for term in cue_terms if term in evidence_lower or self._canonical_token(term) in evidence_tokens}
@@ -2099,14 +2097,14 @@ Rules:
             "slot_tokens": typed_tokens,
         }
 
-    def _select_category1_coverage_ranked(
+    def _select_multi_item_coverage_ranked(
         self,
         ranked: List[tuple],
         query: str,
         primary_limit: int,
         k: int,
     ) -> List[tuple]:
-        """Greedily front-load Cat1 candidates that cover different answer slots."""
+        """Greedily front-load candidates that cover different answer slots."""
         if len(ranked) <= 1 or primary_limit <= 1:
             return ranked
 
@@ -2117,7 +2115,7 @@ Rules:
         remaining = pool
         covered_tokens: Set[str] = set()
         selected_sessions: Dict[int, int] = {}
-        slot_profile = self._category1_slot_profile(query)
+        slot_profile = self._multi_item_slot_profile(query)
 
         debug_by_memory_id = {
             str(item.get("memory_id")): item
@@ -2131,8 +2129,8 @@ Rules:
             _, neg_combined_score, original_order, _, memory = item
             memory = self._ensure_memory_schema(memory)
             memory_id = str(memory.id)
-            slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
-            signal = signal_cache.setdefault(memory_id, self._category1_slot_signal(memory, query, slot_profile))
+            slot_tokens = slot_cache.setdefault(memory_id, self._multi_item_slot_tokens(memory, query))
+            signal = signal_cache.setdefault(memory_id, self._multi_item_slot_signal(memory, query, slot_profile))
             new_tokens = slot_tokens - covered_tokens
             lexical_score = self._lexical_relevance(memory, query)
             dia_key = self._dia_sort_key(self._dia_id_for_memory(memory) or "")
@@ -2179,33 +2177,33 @@ Rules:
                 selected_sessions[session_idx] = selected_sessions.get(session_idx, 0) + 1
             memory = self._ensure_memory_schema(best_item[4])
             selection_diagnostics[str(memory.id)] = {
-                "cat1_selected_primary": True,
-                "cat1_selected_rank": len(selected),
-                "cat1_selection_score": round(float(best_score[0]), 6),
-                "cat1_coverage_gain": len(new_tokens),
-                "cat1_new_slot_tokens": sorted(new_tokens)[:12],
-                "cat1_slot_tokens": sorted(slot_tokens)[:20],
-                "cat1_answer_slot_type": signal.get("slot_type"),
-                "cat1_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
-                "cat1_slot_cue_hits": signal.get("slot_cue_hits", []),
-                "cat1_slot_target_hits": signal.get("slot_target_hits", []),
-                "cat1_lexical_score": lexical_score,
+                "multi_item_selected_primary": True,
+                "multi_item_selected_rank": len(selected),
+                "multi_item_selection_score": round(float(best_score[0]), 6),
+                "multi_item_coverage_gain": len(new_tokens),
+                "multi_item_new_slot_tokens": sorted(new_tokens)[:12],
+                "multi_item_slot_tokens": sorted(slot_tokens)[:20],
+                "multi_item_answer_slot_type": signal.get("slot_type"),
+                "multi_item_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
+                "multi_item_slot_cue_hits": signal.get("slot_cue_hits", []),
+                "multi_item_slot_target_hits": signal.get("slot_target_hits", []),
+                "multi_item_lexical_score": lexical_score,
             }
 
         for item in remaining:
             memory = self._ensure_memory_schema(item[4])
             memory_id = str(memory.id)
-            slot_tokens = slot_cache.setdefault(memory_id, self._category1_slot_tokens(memory, query))
-            signal = signal_cache.setdefault(memory_id, self._category1_slot_signal(memory, query, slot_profile))
+            slot_tokens = slot_cache.setdefault(memory_id, self._multi_item_slot_tokens(memory, query))
+            signal = signal_cache.setdefault(memory_id, self._multi_item_slot_signal(memory, query, slot_profile))
             selection_diagnostics[memory_id] = {
-                "cat1_selected_primary": False,
-                "cat1_coverage_gain": len(slot_tokens - covered_tokens),
-                "cat1_slot_tokens": sorted(slot_tokens)[:20],
-                "cat1_answer_slot_type": signal.get("slot_type"),
-                "cat1_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
-                "cat1_slot_cue_hits": signal.get("slot_cue_hits", []),
-                "cat1_slot_target_hits": signal.get("slot_target_hits", []),
-                "cat1_lexical_score": self._lexical_relevance(memory, query),
+                "multi_item_selected_primary": False,
+                "multi_item_coverage_gain": len(slot_tokens - covered_tokens),
+                "multi_item_slot_tokens": sorted(slot_tokens)[:20],
+                "multi_item_answer_slot_type": signal.get("slot_type"),
+                "multi_item_answer_slot_score": round(float(signal.get("slot_score", 0.0)), 6),
+                "multi_item_slot_cue_hits": signal.get("slot_cue_hits", []),
+                "multi_item_slot_target_hits": signal.get("slot_target_hits", []),
+                "multi_item_lexical_score": self._lexical_relevance(memory, query),
             }
 
         reordered = selected + remaining + tail
@@ -2540,6 +2538,7 @@ Rules:
         routed_domains: Optional[List[str]] = None,
         route_domain: bool = True,
         category: Optional[int] = None,
+        evidence_profile: Optional[str] = None,
     ) -> tuple:
         """Find related memories using embedding retrieval."""
         if not self.memories:
@@ -2550,7 +2549,9 @@ Rules:
         self.last_routed_domains = list(routed_domains or [])
         all_memories = list(self.memories.values())
         memory_str = ""
-        ranked = self._retrieval_candidates(query, k, routed_domains, category=category)
+        ranked = self._retrieval_candidates(
+            query, k, routed_domains, category=category, evidence_profile=evidence_profile,
+        )
         filtered_indices = []
         for _, _, _, i, memory in ranked[:k]:
             filtered_indices.append(i)
@@ -2574,6 +2575,7 @@ Rules:
         routed_domains: Optional[List[str]] = None,
         route_domain: bool = True,
         category: Optional[int] = None,
+        evidence_profile: Optional[str] = None,
     ) -> str:
         """Find related memories with neighborhood expansion."""
         if not self.memories:
@@ -2586,14 +2588,20 @@ Rules:
             category_int = int(category) if category is not None else None
         except (TypeError, ValueError):
             category_int = None
+        evidence_profile = str(evidence_profile or "").strip().lower()
+        multi_item_mode = evidence_profile == "multi_item_list" or (
+            not evidence_profile and category_int == 1
+        )
         all_memories = list(self.memories.values())
         id_to_memory = {memory.id: self._ensure_memory_schema(memory) for memory in all_memories}
         dia_lookup = self._build_dia_lookup(all_memories)
         memory_str = ""
         seen_ids = set()
-        ranked = self._retrieval_candidates(query, k, routed_domains, category=category_int)
+        ranked = self._retrieval_candidates(
+            query, k, routed_domains, category=category_int, evidence_profile=evidence_profile,
+        )
         primary_count = 0
-        if category_int == 1:
+        if multi_item_mode:
             primary_limit = min(
                 max(k, DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE),
                 DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE,
@@ -2602,7 +2610,7 @@ Rules:
             primary_limit = min(k, self.final_bundle_size)
         max_context_blocks = (
             DEFAULT_CAT1_MAX_CONTEXT_BLOCKS
-            if category_int == 1
+            if multi_item_mode
             else max(primary_limit, self.final_bundle_max_size)
         )
         local_context_primary_limit = 2
@@ -2618,14 +2626,14 @@ Rules:
             "same_topic": 7,
             "semantic_related": 8,
         }
-        if category_int == 1:
+        if multi_item_mode:
             relation_priority.update({
                 "same_storyline": 0,
                 "image_text_pair": 1,
                 "similar_event": 2,
                 "same_character": 5,
             })
-            ranked = self._select_category1_coverage_ranked(ranked, query, primary_limit, k)
+            ranked = self._select_multi_item_coverage_ranked(ranked, query, primary_limit, k)
             protected_primary_count = primary_limit
             effective_local_context_primary_limit = protected_primary_count
         else:
@@ -2639,7 +2647,7 @@ Rules:
             primary_count += 1
 
             lexical_score = self._lexical_relevance(memory, query)
-            allow_expansion = category_int != 1
+            allow_expansion = not multi_item_mode
             if (
                 allow_expansion
                 and primary_count <= effective_local_context_primary_limit
@@ -2706,7 +2714,7 @@ Rules:
                     edge_reason=edge_reason if relation in {"same_storyline", "image_text_pair"} else None,
                 )
                 neighbor_count += 1
-                neighbor_limit = 1 if category_int == 1 else 2
+                neighbor_limit = 1 if multi_item_mode else 2
                 if neighbor_count >= neighbor_limit or len(seen_ids) >= max_context_blocks:
                     break
             if primary_count >= primary_limit or len(seen_ids) >= max_context_blocks:

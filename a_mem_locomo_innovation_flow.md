@@ -1435,6 +1435,19 @@ question text
 The current Category 2 gate is used only to test whether temporal resolving is
 worth keeping before converting it into question-type-aware routing.
 
+### Superseded by v15 Cleanup
+
+The temporary `category == 2` gate has now been removed from the code. The
+temporal resolver is kept only as a question-type component:
+
+```text
+answer_type == temporal
+  -> resolve_temporal_answer(...)
+```
+
+This preserves the useful v14 diagnostic gain while avoiding benchmark-label
+routing in the final method.
+
 ### Implementation Location
 
 Implemented in:
@@ -1446,18 +1459,15 @@ test_advanced_robust.py
 Main functions:
 
 ```text
-_cat2_temporal_candidates_from_block
-resolve_cat2_temporal_answer
+_temporal_candidates_from_block
+resolve_temporal_answer
 ```
 
 Activation path:
 
 ```python
 if answer_type == "temporal":
-    if int(category) == 2:
-        response = self.resolve_cat2_temporal_answer(response, raw_context, question)
-    else:
-        response = self.normalize_temporal_answer(response, raw_context, question)
+    response = self.resolve_temporal_answer(response, raw_context, question)
 ```
 
 This keeps Category 1, Category 4, and Category 5 behavior unchanged.
@@ -1540,12 +1550,12 @@ cases where evidence is available but the answer model fails to verbalize time.
 Each resolved answer stores:
 
 ```text
-cat2_temporal_resolver_used
-cat2_temporal_selected
-cat2_temporal_candidate_count
-cat2_temporal_initial_response
-cat2_temporal_normalized_response
-cat2_temporal_final_response
+temporal_resolver_used
+temporal_selected
+temporal_candidate_count
+temporal_initial_response
+temporal_normalized_response
+temporal_final_response
 ```
 
 These fields should be inspected together with:
@@ -1577,3 +1587,384 @@ temporal resolver used count
 If the focused run improves Category 2 without obvious regressions in examples,
 the next version should replace the temporary `category == 2` gate with
 question-type-aware temporal routing.
+
+---
+
+## 15. v15 Diagnosis: Evidence Bundle Completeness and Answer Realization
+
+### Motivation
+
+The v13 evidence-first run and the v14 temporal-resolver run expose a broader
+failure mode than any single benchmark category.
+
+v13 on categories 1, 2, 4, and 5:
+
+```text
+total questions: 476
+overall F1: 0.3715
+overall LLM judge score: 0.3824
+
+category 1: hit_any 65/74, hit_all 25/74, judge 19/74
+category 2: hit_any 77/90, hit_all 75/90, judge 54/90
+category 4: hit_any 120/200, hit_all 118/200, judge 103/200
+category 5: hit_any 80/112, hit_all 78/112, judge 6/112
+```
+
+v14 focused on category 2:
+
+```text
+category 2 hit_any: 78/90
+category 2 hit_all: 76/90
+category 2 F1: 0.6782
+category 2 LLM judge score: 0.6444
+```
+
+The temporal resolver improved category 2 answer realization, but it barely
+changed retrieval coverage. Therefore the current bottleneck has three layers:
+
+1. the system often retrieves at least one relevant evidence item, but not the
+   complete evidence bundle;
+2. when the complete evidence is retrieved, the answer model still omits answer
+   qualifiers, list items, temporal granularity, or weak-inference wording;
+3. lexical F1 can look acceptable while the semantic answer is still wrong.
+
+### Key Diagnosis
+
+The current implementation is reasonable as an evidence-preserving graph
+retrieval prototype:
+
+```text
+raw LoCoMo turns are preserved
+domain routing is now soft instead of filtering away evidence
+graph edges expose same_storyline / similar_event / image_text_pair relations
+answer prompts use question-type instructions
+temporal normalization is treated as a support component
+```
+
+However, the current ranking objective is still mostly item-level relevance.
+It scores each memory independently, then appends limited graph or local
+neighbors. This does not directly optimize for answer coverage.
+
+The strongest evidence is the gap between hit_any and hit_all:
+
+```text
+category 1: 87.8% hit_any vs 33.8% hit_all
+category 2: 85.6% hit_any vs 83.3% hit_all
+category 4: 60.0% hit_any vs 59.0% hit_all
+category 5: 71.4% hit_any vs 69.6% hit_all
+```
+
+Category 1 makes the multi-evidence weakness visible, but the underlying issue
+is not category-specific. The retriever lacks a general objective for selecting
+a compact set of complementary evidence blocks.
+
+### Additional Problems Exposed
+
+#### 1. Category-specific gates are accumulating
+
+The current code contains several benchmark-label gates:
+
+```python
+if category_int == 1: ...
+elif category_int == 4: ...
+
+if category == 1:
+    refine_cat1_answer_with_evidence(...)
+```
+
+These gates are useful for diagnostics, but they should not become the final
+paper design. The final version should route by inferred evidence requirement:
+
+```text
+question -> evidence need profile -> retrieval bundle policy -> answer policy
+```
+
+The profile can include:
+
+```text
+single_span
+multi_item_list
+temporal
+weak_inference
+comparison_or_preference
+yes_no_fact
+```
+
+This keeps the method benchmark-independent and preserves the paper's main
+storyline.
+
+#### 2. Category 5 is mainly an answer-realization failure
+
+Category 5 has relatively high gold-evidence coverage:
+
+```text
+hit_all: 78/112
+judge correct: 6/112
+not-mentioned style predictions: 100/112
+```
+
+This means the model is treating weak-inference questions as unsupported
+factual-span questions. The fix should not be a category 5 module. It should be
+an answer policy for inferred weak-inference questions:
+
+```text
+if evidence supports a tendency, return "Likely yes/no" or the most likely
+preference/trait with a short evidence anchor.
+```
+
+This belongs under evidence-grounded answer realization, not under a new
+retrieval mechanism.
+
+#### 3. F1 is not reliable enough for iteration decisions
+
+Examples show high lexical overlap but semantic failure:
+
+```text
+prediction: counseling and mental health
+gold: counseling or mental health for Transgender people
+
+prediction: nature
+gold: dinosaurs, nature
+
+prediction: The week before 17 July 2023
+gold: The weekend before 17 July 2023
+```
+
+Future diagnostics should report:
+
+```text
+hit_all_but_wrong
+miss_all_but_correct
+high_f1_judge_wrong
+not_mentioned_rate
+empty_answer_rate
+answer_type_distribution
+```
+
+LLM judge is currently more informative than F1 for semantic correctness, but
+F1 is still useful for rough regression tracking.
+
+#### 4. Temporal resolution needs question-aware candidate selection
+
+v14 improved category 2, but remaining errors show candidate selection can pick
+the wrong temporal expression from a retrieved bundle:
+
+```text
+charity race: Saturday vs Sunday
+pride parade: wrong retrieved temporal event selected
+week vs weekend granularity mismatch
+last year should sometimes normalize to the anchored year
+```
+
+The resolver should become question-type-aware rather than category-aware, and
+it should choose the temporal candidate whose evidence text best matches the
+event phrase in the question.
+
+#### 5. Graph edges help, but edge construction is still too cue-list driven
+
+The same_storyline graph is a useful innovation, but many cues are currently
+hand-curated. This is acceptable as a first prototype, but the paper story is
+stronger if v15 frames this as:
+
+```text
+typed evidence graph edges are used to construct complementary bundles
+```
+
+instead of:
+
+```text
+typed edge rules are individually tuned for many topics
+```
+
+The next implementation should use the existing edge types, but change the
+selection objective from "top related items" to "minimal sufficient evidence
+bundle".
+
+### v15 Repair Direction
+
+Do not add a new mechanism. Repair the existing five innovation points as one
+pipeline:
+
+```text
+Evidence-preserving writer
+  -> typed episodic graph
+  -> soft domain / hybrid candidate pool
+  -> evidence bundle coverage selector
+  -> question-type answer realization
+  -> bundle-level reflection diagnostics
+```
+
+The key addition is a general evidence need profile:
+
+```text
+question text
+  -> answer type
+  -> required evidence cardinality
+  -> required evidence facets
+```
+
+Example profiles:
+
+```text
+multi_item_list:
+  select diverse blocks covering distinct answer items
+
+temporal:
+  select event-matching blocks with temporal expressions and session anchors
+
+weak_inference:
+  select positive/negative support blocks and require likely-style answer
+
+single_span:
+  select the strongest direct evidence and one local clarifier
+```
+
+This can replace category-specific gates while preserving the existing
+innovations:
+
+```text
+category-specific Cat1 coverage ranking
+  -> profile-based multi_item_list coverage ranking
+
+category-specific Cat2 temporal resolver
+  -> profile-based temporal answer realization
+
+category 5 prompt weakness
+  -> profile-based weak_inference answer realization
+```
+
+### Recommended Next Experiment
+
+The next version should not target one category. It should add diagnostics and a
+small profile layer, then run the same mixed category setting as v13.
+
+Implementation sketch:
+
+1. rename category-specific answer planning into evidence profile planning;
+2. keep current retrieval sources, but select the final context by coverage
+   facets rather than pure item score;
+3. expose structured evidence blocks to the answer model for all profiles;
+4. route temporal normalization by profile, not benchmark category;
+5. log hit_all_but_wrong, high_f1_judge_wrong, not_mentioned_rate, and selected
+   evidence facets.
+
+Expected outcome:
+
+```text
+hit_all should improve for multi-item questions
+not-mentioned rate should drop for weak-inference questions
+high_f1_judge_wrong should become easier to diagnose
+category 2 gains from v14 should remain without using category labels
+```
+
+---
+
+## 16. v15 Implementation Step 1-3: Evidence Profile Routing
+
+### Scope
+
+This iteration implements only the low-risk part of the v15 plan:
+
+1. add a question-text evidence need profile;
+2. keep answer type and evidence profile as separate decisions;
+3. generalize the old Category 1 coverage ranking into a `multi_item_list`
+   profile path.
+
+It does not yet implement:
+
+```text
+temporal candidate reranking by event phrase
+weak-inference answer repair beyond profile-level prompt instruction
+new graph edge types
+new retrieval source modules
+```
+
+### Code Changes
+
+In `test_advanced_robust.py`:
+
+```text
+infer_answer_type(question)
+  -> controls output format
+
+infer_evidence_need_profile(question, answer_type)
+  -> controls evidence bundle policy
+```
+
+The first profile set is:
+
+```text
+single_span
+multi_item_list
+temporal
+weak_inference
+yes_no_fact
+```
+
+The answer path now performs retrieval after profile inference:
+
+```python
+answer_type = infer_answer_type(question)
+evidence_profile = infer_evidence_need_profile(question, answer_type)
+raw_context = retrieve_memory(..., evidence_profile=evidence_profile)
+```
+
+For temporal questions, the v14 temporal resolver is retained as a generic
+question-type component:
+
+```python
+if answer_type == "temporal":
+    response = resolve_temporal_answer(response, raw_context, question)
+```
+
+For multi-item questions, the old Category 1 evidence refinement is now:
+
+```python
+if evidence_profile == "multi_item_list":
+    response = refine_multi_item_answer_with_evidence(...)
+```
+
+In `memory_layer_robust.py`, retrieval accepts the same profile:
+
+```python
+find_related_memories_raw(..., evidence_profile=evidence_profile)
+```
+
+The old Category 1 coverage selector is generalized:
+
+```text
+_category1_query_expansion      -> _multi_item_query_expansion
+_category1_slot_profile         -> _multi_item_slot_profile
+_category1_slot_signal          -> _multi_item_slot_signal
+_select_category1_coverage_ranked -> _select_multi_item_coverage_ranked
+```
+
+New diagnostics use `multi_item_*` fields instead of `cat1_*` fields.
+
+### Why This Should Be a Clean Test
+
+This patch changes the trigger condition, not the core multi-evidence
+algorithm. Therefore a micro experiment can answer one narrow question:
+
+```text
+Does question-text profile routing preserve the useful Category 1 behavior
+while making the method less benchmark-label-dependent?
+```
+
+For a Category 2-only v15 run, the expected behavior is:
+
+```text
+temporal resolver still activates through answer_type == temporal
+no category == 2 gate is used
+retrieval uses the default non-category-2 graph expansion policy
+```
+
+The most important diagnostics to inspect are:
+
+```text
+answer_diagnostics.answer_type
+answer_diagnostics.evidence_profile
+answer_diagnostics.temporal_resolver_used
+retrieval_diagnostics.evidence_hit_all
+metrics.llm_judge_score
+```
