@@ -2297,3 +2297,75 @@ Use this experiment label for result files:
 ```text
 v19_single_rewrite_index_debug
 ```
+
+---
+
+## 21. v20 Retrieval-Only Diagnostics
+
+### Motivation
+
+After v19, the result files can decompose candidate scores, but final answer
+generation and LLM judge scores can still obscure whether the retrieval layer is
+actually improving. v20 adds an evaluation mode that isolates retrieval and
+ranking.
+
+### Implemented Change
+
+The CLI now supports:
+
+```text
+--retrieval_only
+```
+
+When enabled, the evaluation still runs:
+
+```text
+query keyword generation
+retrieval query construction
+rewrite-memory retrieval index
+BM25 / embedding / lexical / entity ranking
+graph expansion
+Cat1 coverage rerank
+retrieval diagnostics
+```
+
+but skips:
+
+```text
+final answer LLM
+answer post-processing
+LLM judge
+answer-level aggregate metrics
+```
+
+### Output Additions
+
+Each result item keeps:
+
+```text
+raw_context
+retrieved_dia_ids
+retrieval_diagnostics
+candidate_debug
+gold_candidate_debug
+```
+
+`gold_candidate_debug` extracts the candidate score decomposition for each gold
+evidence id when it appears in the top-100 diagnostic candidate list. If a gold
+evidence item is not present, it records:
+
+```text
+found_in_candidate_debug: false
+```
+
+This makes it easier to inspect whether low gold ranking is caused by dense
+retrieval, BM25, lexical/entity scoring, graph expansion, or the final fusion
+weights.
+
+### Version Tag
+
+Use this experiment label for retrieval-only result files:
+
+```text
+v20_retrieval_only_debug
+```

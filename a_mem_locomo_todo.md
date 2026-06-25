@@ -67,7 +67,7 @@ whether better node text improves ranking without expanding the edge taxonomy.
 
 ### Current Active Version: v19_single_rewrite_index_debug
 
-Status: active experiment
+Status: superseded by v20_retrieval_only_debug
 
 Reason:
 
@@ -89,6 +89,31 @@ Important constraint:
 
 This is diagnostic and representation cleanup only. It does not increase the
 final evidence context beyond the v18 top-10 setting.
+
+---
+
+### Current Active Version: v20_retrieval_only_debug
+
+Status: active experiment
+
+Reason:
+
+We need to separate retrieval/ranking quality from final answer generation and
+LLM judge noise.
+
+Implemented repair:
+
+```text
+--retrieval_only skips final answer generation
+--retrieval_only disables LLM judge
+retrieval_diagnostics still reports hit_any / hit_all / missed_gold_evidence
+gold_candidate_debug shows each gold evidence item's score decomposition
+```
+
+Important constraint:
+
+This mode is for diagnosing retrieval only. It should not be compared directly
+against answer-level F1 or LLM-judge runs.
 
 ---
 

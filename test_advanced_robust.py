@@ -99,6 +99,24 @@ class RobustAdvancedMemAgent:
     def retrieve_memory(self, content, k=10, category=None):
         return self.memory_system.find_related_memories_raw(content, k=k, category=category)
 
+    def retrieve_context_only(self, question: str, category: int) -> tuple:
+        """Run the retrieval pipeline without calling the final answer LLM."""
+        self.last_answer_debug = {"retrieval_only": True}
+        keywords = self.generate_query_llm(question)
+        retrieval_query = self.build_retrieval_query(question, keywords)
+        raw_context = self.retrieve_memory(retrieval_query, k=self.retrieve_k, category=category)
+        retrieval_prompt = (
+            "[retrieval_only]\n"
+            f"Question: {question}\n"
+            f"Generated keywords: {keywords}\n"
+            f"Retrieval query: {retrieval_query}"
+        )
+        self.last_answer_debug.update({
+            "generated_keywords": keywords,
+            "retrieval_query": retrieval_query,
+        })
+        return "", retrieval_prompt, raw_context
+
     @staticmethod
     def build_retrieval_query(question: str, keywords: str) -> str:
         """Keep the original question in retrieval so keyword drift cannot erase key evidence."""
@@ -230,6 +248,21 @@ Keywords:"""
         evidence_hit_any = bool(gold_evidence) and any(dia_id in retrieved_set for dia_id in gold_evidence)
         evidence_hit_all = bool(gold_evidence) and all(dia_id in retrieved_set for dia_id in gold_evidence)
         candidate_debug = getattr(self.memory_system, "last_candidate_debug", []) or []
+        candidate_by_dia_id = {
+            str(item.get("dia_id")): item
+            for item in candidate_debug
+            if item.get("dia_id") is not None
+        }
+        gold_candidate_debug = []
+        for dia_id in gold_evidence:
+            item = candidate_by_dia_id.get(str(dia_id))
+            if item:
+                gold_candidate_debug.append(item)
+            else:
+                gold_candidate_debug.append({
+                    "dia_id": dia_id,
+                    "found_in_candidate_debug": False,
+                })
         return {
             "gold_evidence": gold_evidence,
             "retrieved_dia_ids": retrieved_dia_ids,
@@ -241,6 +274,7 @@ Keywords:"""
             "relation_counts": self._relation_counts(raw_context),
             "routed_domains": list(getattr(self.memory_system, "last_routed_domains", []) or []),
             "candidate_debug": candidate_debug[:100],
+            "gold_candidate_debug": gold_candidate_debug,
         }
 
     @staticmethod
@@ -977,7 +1011,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      judge_backend: Optional[str] = None,
                      judge_model: Optional[str] = None,
                      judge_sglang_host: Optional[str] = None,
-                     judge_sglang_port: Optional[int] = None):
+                     judge_sglang_port: Optional[int] = None,
+                     retrieval_only: bool = False):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -1014,7 +1049,11 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     compress_categories = compress_categories or set()
     eval_logger.info(f"Evaluating categories: {allow_categories}")
     eval_logger.info(f"Compressing retrieved context for categories: {sorted(compress_categories)}")
+    eval_logger.info(f"Retrieval-only mode: {retrieval_only}")
     judge_evaluator = None
+    if use_llm_judge and retrieval_only:
+        eval_logger.info("Retrieval-only mode disables LLM judge.")
+        use_llm_judge = False
     if use_llm_judge:
         judge_backend = judge_backend or backend
         judge_model = judge_model or model
@@ -1138,9 +1177,14 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 total_questions += 1
                 category_counts[qa.category] += 1
 
-                prediction, user_prompt, raw_context = agent.answer_question(
-                    qa.question, qa.category, qa.final_answer
-                )
+                if retrieval_only:
+                    prediction, user_prompt, raw_context = agent.retrieve_context_only(
+                        qa.question, qa.category
+                    )
+                else:
+                    prediction, user_prompt, raw_context = agent.answer_question(
+                        qa.question, qa.category, qa.final_answer
+                    )
 
                 # Parse the prediction (handles both JSON and plain text)
                 prediction = parse_plain_text_answer(prediction)
@@ -1152,7 +1196,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 eval_logger.info(f"Category: {qa.category}")
                 eval_logger.info(f"Raw Context: {raw_context}")
 
-                metrics = calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
+                metrics = {} if retrieval_only else calculate_metrics(prediction, qa.final_answer) if qa.final_answer else {
                     "exact_match": 0, "f1": 0.0, "rouge1_f": 0.0, "rouge2_f": 0.0,
                     "rougeL_f": 0.0, "bleu1": 0.0, "bleu2": 0.0, "bleu3": 0.0,
                     "bleu4": 0.0, "bert_f1": 0.0, "meteor": 0.0, "sbert_similarity": 0.0
@@ -1171,8 +1215,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                         judge_result.get("reason"),
                     )
 
-                all_metrics.append(metrics)
-                all_categories.append(qa.category)
+                if not retrieval_only:
+                    all_metrics.append(metrics)
+                    all_categories.append(qa.category)
                 retrieval_diagnostics = agent.retrieval_diagnostics(raw_context, qa.evidence)
                 diag_category = str(qa.category)
                 retrieval_diagnostic_counts[diag_category]["total"] += 1
@@ -1206,7 +1251,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 if total_questions % 10 == 0:
                     eval_logger.info(f"Processed {total_questions} questions")
 
-    aggregate_results = aggregate_metrics(all_metrics, all_categories)
+    aggregate_results = {} if retrieval_only else aggregate_metrics(all_metrics, all_categories)
 
     final_results = {
         "model": model,
@@ -1215,6 +1260,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "compress_context": bool(compress_categories),
         "compress_categories": sorted(compress_categories),
         "llm_judge_enabled": bool(use_llm_judge),
+        "retrieval_only": bool(retrieval_only),
         "judge_backend": judge_backend if use_llm_judge else None,
         "judge_model": judge_model if use_llm_judge else None,
         "metric_aliases": {"J": "llm_judge_score"} if use_llm_judge else {},
@@ -1279,6 +1325,8 @@ def main():
                         help="Comma-separated categories to compress, e.g. '1,2'. Overrides the default no-compression behavior")
     parser.add_argument("--llm_judge", action="store_true",
                         help="Add binary LLM-Judge score (J) using question, reference, and prediction")
+    parser.add_argument("--retrieval_only", action="store_true",
+                        help="Run retrieval/ranking diagnostics only; skip final answer generation and LLM judge")
     parser.add_argument("--judge_backend", type=str, default=None,
                         help="Optional judge backend. Defaults to --backend")
     parser.add_argument("--judge_model", type=str, default=None,
@@ -1329,6 +1377,7 @@ def main():
         args.sglang_host, args.sglang_port, allow_categories,
         compress_categories, args.llm_judge, args.judge_backend,
         args.judge_model, args.judge_sglang_host, args.judge_sglang_port,
+        args.retrieval_only,
     )
 
 
