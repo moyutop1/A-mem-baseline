@@ -94,7 +94,7 @@ final evidence context beyond the v18 top-10 setting.
 
 ### Current Active Version: v20_retrieval_only_debug
 
-Status: active experiment
+Status: superseded by v21_disable_cat1_coverage_ablation
 
 Reason:
 
@@ -114,6 +114,31 @@ Important constraint:
 
 This mode is for diagnosing retrieval only. It should not be compared directly
 against answer-level F1 or LLM-judge runs.
+
+---
+
+### Current Active Version: v21_disable_cat1_coverage_ablation
+
+Status: active experiment
+
+Reason:
+
+The v20 source-ablation result suggests that fused `combined_score@10` can beat
+the actual final retrieved context, which points to Cat1 coverage rerank as a
+possible source of missed gold evidence.
+
+Implemented repair:
+
+```text
+--disable_cat1_coverage_rerank skips Cat1 coverage rerank
+Cat1 then uses fused combined-score order directly
+candidate_debug marks cat1_coverage_rerank_disabled=true
+```
+
+Important constraint:
+
+This is an ablation switch. Do not permanently remove coverage rerank until the
+retrieval-only result proves disabling it improves Cat1 hit_all.
 
 ---
 

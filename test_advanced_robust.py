@@ -73,13 +73,15 @@ class RobustAdvancedMemAgent:
 
     def __init__(self, model, backend, retrieve_k, temperature_c5,
                  sglang_host="http://localhost", sglang_port=30000,
-                 compress_categories: Optional[Set[int]] = None):
+                 compress_categories: Optional[Set[int]] = None,
+                 enable_cat1_coverage_rerank: bool = True):
         self.memory_system = RobustAgenticMemorySystem(
             model_name=EMBEDDING_MODEL_NAME,
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
             sglang_port=sglang_port,
+            enable_cat1_coverage_rerank=enable_cat1_coverage_rerank,
         )
         self.retriever_llm = RobustLLMController(
             backend=backend,
@@ -1012,7 +1014,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                      judge_model: Optional[str] = None,
                      judge_sglang_host: Optional[str] = None,
                      judge_sglang_port: Optional[int] = None,
-                     retrieval_only: bool = False):
+                     retrieval_only: bool = False,
+                     enable_cat1_coverage_rerank: bool = True):
     """Evaluate the robust agent on the LoComo dataset."""
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_robust_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -1050,6 +1053,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     eval_logger.info(f"Evaluating categories: {allow_categories}")
     eval_logger.info(f"Compressing retrieved context for categories: {sorted(compress_categories)}")
     eval_logger.info(f"Retrieval-only mode: {retrieval_only}")
+    eval_logger.info(f"Cat1 coverage rerank enabled: {enable_cat1_coverage_rerank}")
     judge_evaluator = None
     if use_llm_judge and retrieval_only:
         eval_logger.info("Retrieval-only mode disables LLM judge.")
@@ -1077,7 +1081,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         # 并根据问题和上下文生成答案。
         # 每个样本都会创建一个新的agent实例，以确保记忆系统从头开始构建，避免不同样本之间的记忆干扰。
         agent = RobustAdvancedMemAgent(model, backend, retrieve_k, temperature_c5,
-                                       sglang_host, sglang_port, compress_categories)
+                                       sglang_host, sglang_port, compress_categories,
+                                       enable_cat1_coverage_rerank)
 
         memory_cache_file = os.path.join(memories_dir, f"memory_cache_sample_{sample_idx}.pkl")
         retriever_cache_file = os.path.join(memories_dir, f"retriever_cache_sample_{sample_idx}.pkl")
@@ -1261,6 +1266,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         "compress_categories": sorted(compress_categories),
         "llm_judge_enabled": bool(use_llm_judge),
         "retrieval_only": bool(retrieval_only),
+        "cat1_coverage_rerank_enabled": bool(enable_cat1_coverage_rerank),
         "judge_backend": judge_backend if use_llm_judge else None,
         "judge_model": judge_model if use_llm_judge else None,
         "metric_aliases": {"J": "llm_judge_score"} if use_llm_judge else {},
@@ -1327,6 +1333,8 @@ def main():
                         help="Add binary LLM-Judge score (J) using question, reference, and prediction")
     parser.add_argument("--retrieval_only", action="store_true",
                         help="Run retrieval/ranking diagnostics only; skip final answer generation and LLM judge")
+    parser.add_argument("--disable_cat1_coverage_rerank", action="store_true",
+                        help="Disable Cat1 coverage rerank and use fused combined-score ordering directly")
     parser.add_argument("--judge_backend", type=str, default=None,
                         help="Optional judge backend. Defaults to --backend")
     parser.add_argument("--judge_model", type=str, default=None,
@@ -1378,6 +1386,7 @@ def main():
         compress_categories, args.llm_judge, args.judge_backend,
         args.judge_model, args.judge_sglang_host, args.judge_sglang_port,
         args.retrieval_only,
+        not args.disable_cat1_coverage_rerank,
     )
 
 

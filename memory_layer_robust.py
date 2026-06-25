@@ -590,7 +590,8 @@ class RobustAgenticMemorySystem:
                  global_bm25_top_k: int = DEFAULT_GLOBAL_BM25_TOP_K,
                  global_entity_top_k: int = DEFAULT_GLOBAL_ENTITY_TOP_K,
                  final_bundle_size: int = DEFAULT_FINAL_BUNDLE_SIZE,
-                 final_bundle_max_size: int = DEFAULT_FINAL_BUNDLE_MAX_SIZE):
+                 final_bundle_max_size: int = DEFAULT_FINAL_BUNDLE_MAX_SIZE,
+                 enable_cat1_coverage_rerank: bool = True):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         model_name = model_name or DEFAULT_EMBEDDING_MODEL
@@ -609,6 +610,7 @@ class RobustAgenticMemorySystem:
         self.global_entity_top_k = max(0, int(global_entity_top_k))
         self.final_bundle_size = max(1, int(final_bundle_size))
         self.final_bundle_max_size = max(self.final_bundle_size, int(final_bundle_max_size))
+        self.enable_cat1_coverage_rerank = bool(enable_cat1_coverage_rerank)
         self.offline_domain_tree: List[Dict[str, Any]] = []
         self.last_candidate_debug: List[Dict[str, Any]] = []
         self.last_routed_domains: List[str] = []
@@ -2740,7 +2742,7 @@ Rules:
             "same_topic": 7,
             "semantic_related": 8,
         }
-        if category_int == 1:
+        if category_int == 1 and self.enable_cat1_coverage_rerank:
             relation_priority.update({
                 "same_storyline": 0,
                 "image_text_pair": 1,
@@ -2750,6 +2752,13 @@ Rules:
             ranked = self._select_category1_coverage_ranked(ranked, query, primary_limit, k)
             protected_primary_count = primary_limit
             effective_local_context_primary_limit = protected_primary_count
+        elif category_int == 1:
+            protected_primary_count = 0
+            effective_local_context_primary_limit = local_context_primary_limit
+            self.last_candidate_debug = [
+                dict(item, cat1_coverage_rerank_disabled=True)
+                for item in self.last_candidate_debug
+            ]
         else:
             protected_primary_count = 0
             effective_local_context_primary_limit = local_context_primary_limit

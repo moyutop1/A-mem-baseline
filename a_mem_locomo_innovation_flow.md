@@ -2369,3 +2369,56 @@ Use this experiment label for retrieval-only result files:
 ```text
 v20_retrieval_only_debug
 ```
+
+---
+
+## 22. v21 Cat1 Coverage Rerank Ablation
+
+### Motivation
+
+The v20 source-ablation result showed that sorting by the fused
+`combined_score` can outperform the actual final context in aggregate:
+
+```text
+actual cat1+cat2 hit_all: 106 / 164
+combined_score@10 hit_all: 110 / 164
+```
+
+This suggests the Cat1 coverage rerank may sometimes replace high-scoring gold
+evidence with diverse but less answer-bearing candidates.
+
+### What Coverage Rerank Does
+
+Cat1 coverage rerank is a greedy post-reranker. It takes the fused candidate
+ranking and tries to front-load candidates that add new answer-slot tokens,
+different sessions, and inferred slot cues.
+
+Its intent is useful for multi-answer questions, but the current slot-token
+definition can be too broad, causing broad diversity to beat direct relevance.
+
+### Implemented Ablation
+
+v21 adds:
+
+```text
+--disable_cat1_coverage_rerank
+```
+
+When this flag is set, Cat1 retrieval skips `_select_category1_coverage_ranked`
+and exposes the fused `combined_score` order directly. Candidate debug entries
+are marked with:
+
+```text
+cat1_coverage_rerank_disabled: true
+```
+
+This does not delete the mechanism; it lets us test whether the mechanism is
+currently helpful or harmful before deciding whether to remove or redesign it.
+
+### Version Tag
+
+Use this experiment label for result files:
+
+```text
+v21_disable_cat1_coverage_ablation
+```
