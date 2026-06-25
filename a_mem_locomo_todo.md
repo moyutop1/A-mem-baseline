@@ -40,7 +40,7 @@ reintroduced without hurting Cat1.
 
 ### Current Active Version: v18_rewrite_memory_top10
 
-Status: active experiment
+Status: superseded by v19_single_rewrite_index_debug
 
 Reason:
 
@@ -62,6 +62,33 @@ Important constraint:
 
 Do not add new graph edge types for this iteration. The purpose is to test
 whether better node text improves ranking without expanding the edge taxonomy.
+
+---
+
+### Current Active Version: v19_single_rewrite_index_debug
+
+Status: active experiment
+
+Reason:
+
+v18 normalized memory content, but the retriever document still repeated
+`rewrite_content` three times as an old weighting heuristic. v19 removes that
+repetition and adds score diagnostics for debugging low-ranked gold evidence.
+
+Implemented repair:
+
+```text
+rewrite_content appears once in _memory_to_index_text
+retriever cache version is bumped
+candidate_debug stores score_inputs, score_weights, score_contributions
+candidate_debug stores combined_rank and source_ranks
+candidate_debug output expands to top 100 candidates
+```
+
+Important constraint:
+
+This is diagnostic and representation cleanup only. It does not increase the
+final evidence context beyond the v18 top-10 setting.
 
 ---
 

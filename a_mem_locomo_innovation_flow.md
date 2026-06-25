@@ -2217,3 +2217,83 @@ Use this experiment label for result files:
 ```text
 v18_rewrite_memory_top10
 ```
+
+---
+
+## 20. v19 Single Rewrite Index and Score Diagnostics
+
+### Motivation
+
+v18 used `rewrite_content` as the retrieval representation, but
+`_memory_to_index_text` still repeated the main evidence text three times. That
+was an old field-weighting heuristic from the raw-dialogue retrieval setting.
+With normalized rewrite memory, the repetition is harder to justify and may
+over-amplify broad terms such as family, support, event, and activity.
+
+v19 removes this repetition and adds richer diagnostics so failed gold evidence
+can be traced to the scoring mechanism that suppressed it.
+
+### Index Text Change
+
+The retriever document now contains one copy of the normalized memory:
+
+```text
+rewrite_content
+metadata: dia_id + session_date + speaker + keywords + tags
+status
+visual cue: image_caption + image_query
+```
+
+The retriever cache version is bumped:
+
+```text
+robust_retrieval_v8_rewrite_single_index_debug
+```
+
+### Candidate Score Diagnostics
+
+Each candidate debug entry now records:
+
+```text
+score_inputs
+score_weights
+score_contributions
+combined_rank
+source_ranks
+```
+
+`score_contributions` decomposes the final combined score into weighted terms:
+
+```text
+domain_embedding
+domain_bm25
+domain_lexical
+global_embedding
+global_bm25
+global_entity
+graph_expansion
+domain_match
+lexical
+reliability
+citation
+session_bonus
+```
+
+`source_ranks` shows where the same memory ranked under individual scoring
+channels, making it easier to tell whether a missed gold evidence item was
+suppressed by dense retrieval, BM25, lexical overlap, entity matching, graph
+expansion, or Cat1 coverage selection.
+
+### Result File Diagnostics
+
+The saved `candidate_debug` list is expanded from top 30 to top 100 candidates
+per question. This is diagnostic-only: it does not increase the final evidence
+context shown to the answer LLM.
+
+### Version Tag
+
+Use this experiment label for result files:
+
+```text
+v19_single_rewrite_index_debug
+```

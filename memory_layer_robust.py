@@ -155,7 +155,7 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v7_rewrite_memory_index"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v8_rewrite_single_index_debug"
 DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v7_rewrite_memory_edges"
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
@@ -1999,35 +1999,79 @@ Rules:
             if category_int == 1 and dia_key:
                 # Small diversity bonus during ordering so multi-hop candidates do not all come from one session.
                 session_bonus = max(0.0, 0.04 - 0.02 * session_counts.get(dia_key[0], 0))
-            combined_score = (
-                weights["domain_embedding"] * score_parts["domain_embedding"]
-                + weights["domain_bm25"] * score_parts["domain_bm25"]
-                + weights["domain_lexical"] * score_parts["domain_lexical"]
-                + weights["global_embedding"] * score_parts["global_embedding"]
-                + weights["global_bm25"] * score_parts["global_bm25"]
-                + weights["global_entity"] * score_parts["global_entity"]
-                + weights["graph_expansion"] * min(1.0, score_parts["graph_expansion"])
-                + weights["domain_match"] * score_parts["domain_match"]
-                + weights["lexical"] * lexical_norm
-                + 0.07 * reliability
-                + 0.03 * min(1.0, citation_score)
-                + session_bonus
-            )
+            score_inputs = {
+                "domain_embedding": score_parts["domain_embedding"],
+                "domain_bm25": score_parts["domain_bm25"],
+                "domain_lexical": score_parts["domain_lexical"],
+                "global_embedding": score_parts["global_embedding"],
+                "global_bm25": score_parts["global_bm25"],
+                "global_entity": score_parts["global_entity"],
+                "graph_expansion": min(1.0, score_parts["graph_expansion"]),
+                "domain_match": score_parts["domain_match"],
+                "lexical_norm": lexical_norm,
+                "reliability": reliability,
+                "citation": min(1.0, citation_score),
+                "session_bonus": session_bonus,
+            }
+            score_contributions = {
+                "domain_embedding": weights["domain_embedding"] * score_inputs["domain_embedding"],
+                "domain_bm25": weights["domain_bm25"] * score_inputs["domain_bm25"],
+                "domain_lexical": weights["domain_lexical"] * score_inputs["domain_lexical"],
+                "global_embedding": weights["global_embedding"] * score_inputs["global_embedding"],
+                "global_bm25": weights["global_bm25"] * score_inputs["global_bm25"],
+                "global_entity": weights["global_entity"] * score_inputs["global_entity"],
+                "graph_expansion": weights["graph_expansion"] * score_inputs["graph_expansion"],
+                "domain_match": weights["domain_match"] * score_inputs["domain_match"],
+                "lexical": weights["lexical"] * score_inputs["lexical_norm"],
+                "reliability": 0.07 * score_inputs["reliability"],
+                "citation": 0.03 * score_inputs["citation"],
+                "session_bonus": session_bonus,
+            }
+            combined_score = sum(score_contributions.values())
             if dia_key:
                 session_counts[dia_key[0]] = session_counts.get(dia_key[0], 0) + 1
             debug_parts = dict(score_parts)
             debug_parts["source_tags"] = sorted(debug_parts.get("source_tags", []))
             debug_parts["combined_score"] = combined_score
             debug_parts["lexical_score"] = lexical_score
+            debug_parts["lexical_norm"] = lexical_norm
+            debug_parts["reliability_score"] = reliability
+            debug_parts["citation_score"] = score_inputs["citation"]
+            debug_parts["session_bonus"] = session_bonus
+            debug_parts["score_weights"] = dict(weights)
+            debug_parts["score_inputs"] = score_inputs
+            debug_parts["score_contributions"] = score_contributions
             debug_parts["dia_id"] = self._dia_id_for_memory(memory)
             debug_parts["memory_id"] = memory.id
             candidate_scores[idx] = debug_parts
             ranked.append((self.lifecycle_penalty(memory), -combined_score, order, idx, memory))
 
         ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+        for combined_rank, item in enumerate(ranked, start=1):
+            idx = item[3]
+            if idx in candidate_scores:
+                candidate_scores[idx]["combined_rank"] = combined_rank
+
+        rank_components = [
+            "domain_embedding", "domain_bm25", "domain_lexical",
+            "global_embedding", "global_bm25", "global_entity",
+            "graph_expansion", "domain_match", "lexical_norm",
+            "reliability_score", "citation_score", "combined_score",
+        ]
+        for component in rank_components:
+            sorted_items = sorted(
+                candidate_scores.items(),
+                key=lambda pair: float(pair[1].get(component, 0.0) or 0.0),
+                reverse=True,
+            )
+            for rank, (idx, debug) in enumerate(sorted_items, start=1):
+                value = float(debug.get(component, 0.0) or 0.0)
+                ranks = debug.setdefault("source_ranks", {})
+                ranks[component] = rank if value > 0.0 or component == "combined_score" else None
+
         self.last_candidate_debug = [
             candidate_scores.get(item[3], {})
-            for item in ranked[: max(k * 3, self.final_bundle_max_size)]
+            for item in ranked[: max(100, k * 10, self.final_bundle_max_size)]
         ]
         return ranked
 
@@ -2285,7 +2329,7 @@ Rules:
 
         reordered = selected + remaining + tail
         updated_debug = []
-        for _, _, _, _, memory in reordered[: max(k * 3, self.final_bundle_max_size)]:
+        for _, _, _, _, memory in reordered[: max(100, k * 10, self.final_bundle_max_size)]:
             debug = debug_by_memory_id.get(str(memory.id))
             if not debug:
                 continue
@@ -2313,8 +2357,6 @@ Rules:
             " ".join(getattr(memory, "tags", [])),
         ]).strip()
         pieces = [
-            "rewrite_content: " + main_content,
-            "rewrite_content: " + main_content,
             "rewrite_content: " + main_content,
             "metadata: " + metadata,
             "status: " + getattr(memory, "status", "active"),

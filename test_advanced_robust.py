@@ -240,7 +240,7 @@ Keywords:"""
             ],
             "relation_counts": self._relation_counts(raw_context),
             "routed_domains": list(getattr(self.memory_system, "last_routed_domains", []) or []),
-            "candidate_debug": candidate_debug[:30],
+            "candidate_debug": candidate_debug[:100],
         }
 
     @staticmethod
