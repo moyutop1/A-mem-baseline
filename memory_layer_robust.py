@@ -155,8 +155,10 @@ DEFAULT_MEMORY_LEVEL = "instance"
 DEFAULT_DOMAIN_CANDIDATE_TOP_K = 3
 DEFAULT_DOMAIN_EMBEDDING_THRESHOLD = 0.25
 DEFAULT_EMBEDDING_MODEL = os.getenv("SENTENCE_MODEL_PATH", "all-MiniLM-L6-v2")
-RETRIEVAL_INDEX_VERSION = "robust_retrieval_v8_rewrite_single_index_debug"
-DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v7_rewrite_memory_edges"
+RETRIEVAL_INDEX_VERSION = "robust_retrieval_v9_answer_slot_rewrite_no_graph"
+DOMAIN_GRAPH_CACHE_VERSION = "domain_graph_v8_answer_slot_rewrite"
+REWRITE_CONTENT_VERSION = "answer_slot_rewrite_v1"
+ENABLE_GRAPH_EXPANSION = False
 DEFAULT_DOMAIN_TOP_K = 3
 DEFAULT_DOMAIN_SEED_TOP_K = 20
 DEFAULT_GLOBAL_FALLBACK_TOP_K = 5
@@ -168,14 +170,14 @@ DEFAULT_CAT1_PRIMARY_BUNDLE_SIZE = 10
 DEFAULT_CAT1_MAX_CONTEXT_BLOCKS = 10
 DEFAULT_CAT1_EXPANDED_GLOBAL_TOP_K = 40
 
-REWRITE_MEMORY_PROMPT = """Rewrite one LoCoMo memory into a retrieval-oriented evidence sentence.
+REWRITE_MEMORY_PROMPT = """Rewrite one LoCoMo memory into a retrieval-oriented answer-slot evidence sentence.
 
 Raw memory:
 {content}
 
 Return JSON only:
 {{
-  "rewrite_content": "one self-contained evidence sentence"
+  "rewrite_content": "one self-contained answer-slot evidence sentence"
 }}
 
 Requirements:
@@ -183,6 +185,9 @@ Requirements:
 - Preserve concrete names, activities, objects, places, dates, and visual evidence.
 - Anchor relative time with the session date when it is available, while keeping the original relative cue if useful.
 - Include image_caption or image_query facts when they contain answer-bearing evidence.
+- Expose the answer slot explicitly when possible, using concise labels such as activity, event, place, person, support source, object/item, book/media, art subject, music artist/band, pet/name, identity/status, relationship, career/goal, count fact, temporal fact, preference, or trait.
+- Prefer the format "Subject slot: item; qualifier; time" when the memory contains a clear answer item.
+- If several answer-bearing items are present, keep them in one concise sentence separated by semicolons.
 - Do not add facts not supported by the raw memory.
 - Keep it concise, preferably under 55 words.
 """
@@ -450,6 +455,7 @@ class RobustMemoryNote:
                  content: str,
                  current_content: Optional[str] = None,
                  rewrite_content: Optional[str] = None,
+                 rewrite_version: Optional[str] = None,
                  id: Optional[str] = None,
                  keywords: Optional[List[str]] = None,
                  links: Optional[List[Any]] = None,
@@ -481,6 +487,7 @@ class RobustMemoryNote:
         self.content = current_content or content
         self.current_content = self.content
         self.rewrite_content = rewrite_content or ""
+        self.rewrite_version = rewrite_version or ""
 
         if llm_controller and any(p is None for p in [keywords, context, category, tags]):
             analysis = self.analyze_content(content, llm_controller)
@@ -642,15 +649,15 @@ class RobustAgenticMemorySystem:
         image_query = fields.get("image_query", "").strip()
         pieces = []
         if speaker:
-            pieces.append(f"{speaker} said: {content}")
+            pieces.append(f"{speaker} evidence fact: {content}")
         else:
-            pieces.append(content)
+            pieces.append(f"Evidence fact: {content}")
         if session_date:
-            pieces.append(f"Session date: {session_date}.")
+            pieces.append(f"time: {session_date}.")
         if image_caption:
-            pieces.append(f"Image caption: {image_caption}.")
+            pieces.append(f"visual evidence: {image_caption}.")
         if image_query:
-            pieces.append(f"Image query: {image_query}.")
+            pieces.append(f"visual query: {image_query}.")
         return re.sub(r"\s+", " ", " ".join(piece for piece in pieces if piece)).strip()
 
     def _rewrite_memory_content(self, memory: RobustMemoryNote) -> str:
@@ -671,10 +678,12 @@ class RobustAgenticMemorySystem:
 
     def _ensure_rewrite_content(self, memory: RobustMemoryNote) -> None:
         rewrite = str(getattr(memory, "rewrite_content", "") or "").strip()
-        if rewrite:
+        rewrite_version = str(getattr(memory, "rewrite_version", "") or "")
+        if rewrite and rewrite_version == REWRITE_CONTENT_VERSION:
             memory.rewrite_content = re.sub(r"\s+", " ", rewrite).strip()
             return
         memory.rewrite_content = self._rewrite_memory_content(memory)
+        memory.rewrite_version = REWRITE_CONTENT_VERSION
 
     def _retrieval_memory_text(self, memory: RobustMemoryNote) -> str:
         rewrite = str(getattr(memory, "rewrite_content", "") or "").strip()
@@ -1752,6 +1761,44 @@ Rules:
         scored.sort(reverse=True)
         return scored[:top_k]
 
+    @staticmethod
+    def _answer_slot_terms(query: str) -> Set[str]:
+        query_lower = str(query or "").lower()
+        slot_map = {
+            "activity": r"\bactivit|partake|destress|hikes?|camp|paint|pottery|swim|run|family\b",
+            "event": r"\bevents?|participat|attended|community|conference|meeting|group|parade|speech|fundraiser\b",
+            "place": r"\bwhere|places?|cities?|countries?|beach|park|trail|museum|visited|moved\b",
+            "person": r"\bwho|people|person|support|supports|friend|mentor|family|children|kids\b",
+            "support source": r"\bsupport|supports|helped|negative experience\b",
+            "object item": r"\bitems?|objects?|symbols?|instrument|shoes|necklace|tattoo|pottery\b",
+            "book media": r"\bbooks?|read|novel|suggestion|recommended|media\b",
+            "art subject": r"\bpaint|painting|art|subject|make\b",
+            "music artist band": r"\bmusical artists?|bands?|concert|music|seen\b",
+            "pet name": r"\bpets?|names?|dog|cat\b",
+            "identity status": r"\bidentity|status|transition|transgender|relationship status\b",
+            "career goal": r"\bcareer|goal|work|business|venture|studio|path\b",
+            "count fact": r"\bhow many|number of|count\b",
+            "temporal fact": r"\bwhen|how long|date|time|year|month|week\b",
+            "preference trait": r"\bprefer|preference|trait|interested|likes?|would\b",
+        }
+        return {slot for slot, pattern in slot_map.items() if re.search(pattern, query_lower)}
+
+    def _answer_slot_signal(self, memory: RobustMemoryNote, query: str) -> float:
+        """Question-conditioned answer-slot match over rewrite_content, shared by all categories."""
+        rewrite_text = self._retrieval_memory_text(memory)
+        rewrite_lower = rewrite_text.lower()
+        query_tokens = self._retrieval_tokens(query)
+        rewrite_tokens = self._retrieval_tokens(rewrite_text)
+        target_overlap = len(query_tokens & rewrite_tokens)
+        slot_terms = self._answer_slot_terms(query)
+        slot_hits = 0
+        for slot in slot_terms:
+            slot_parts = set(slot.split())
+            if slot in rewrite_lower or bool(slot_parts & rewrite_tokens):
+                slot_hits += 1
+        colon_bonus = 1.0 if ":" in rewrite_text and slot_hits else 0.0
+        return min(1.0, (0.18 * min(5, target_overlap)) + (0.28 * min(2, slot_hits)) + (0.10 * colon_bonus))
+
     def _retrieval_candidates(
         self,
         query: str,
@@ -1799,6 +1846,7 @@ Rules:
                 "global_bm25": 0.0,
                 "global_entity": 0.0,
                 "graph_expansion": 0.0,
+                "answer_slot": 0.0,
                 "domain_match": 0.0,
                 "source_tags": set(),
             })
@@ -1902,7 +1950,7 @@ Rules:
                 key=lambda pair: _pre_graph_score(pair[1]),
                 reverse=True,
             )[:seed_limit]
-        ]
+        ] if ENABLE_GRAPH_EXPANSION else []
         graph_added = 0
         for seed_idx in seed_indices:
             if seed_idx >= len(all_memories) or graph_added >= graph_candidate_limit:
@@ -1955,8 +2003,12 @@ Rules:
                 continue
             score_parts = candidate_scores[idx]
             lexical_score = self._lexical_relevance(memory, lexical_query)
+            answer_slot_score = self._answer_slot_signal(memory, query)
             domain_score = 1.0 if self._domain_overlap(memory, query_domains) else 0.0
             score_parts["domain_match"] = domain_score
+            score_parts["answer_slot"] = answer_slot_score
+            if answer_slot_score > 0.0:
+                score_parts["source_tags"].add("answer_slot")
             reliability = self.memory_reliability(memory)
             citation_score = math.log1p(float(getattr(memory, "citation_count", 0))) / 5.0
             lexical_norm = min(1.0, lexical_score / 8.0)
@@ -1968,7 +2020,8 @@ Rules:
                     "global_embedding": 0.05,
                     "global_bm25": 0.30,
                     "global_entity": 0.25,
-                    "graph_expansion": 0.05,
+                    "graph_expansion": 0.0,
+                    "answer_slot": 0.12,
                     "domain_match": 0.05,
                     "lexical": 0.20,
                 }
@@ -1980,7 +2033,8 @@ Rules:
                     "global_embedding": 0.07,
                     "global_bm25": 0.22,
                     "global_entity": 0.18,
-                    "graph_expansion": 0.18,
+                    "graph_expansion": 0.0,
+                    "answer_slot": 0.14,
                     "domain_match": 0.08,
                     "lexical": 0.18,
                 }
@@ -1992,7 +2046,8 @@ Rules:
                     "global_embedding": 0.08,
                     "global_bm25": 0.18,
                     "global_entity": 0.14,
-                    "graph_expansion": 0.10,
+                    "graph_expansion": 0.0,
+                    "answer_slot": 0.12,
                     "domain_match": 0.10,
                     "lexical": 0.18,
                 }
@@ -2009,6 +2064,7 @@ Rules:
                 "global_bm25": score_parts["global_bm25"],
                 "global_entity": score_parts["global_entity"],
                 "graph_expansion": min(1.0, score_parts["graph_expansion"]),
+                "answer_slot": score_parts["answer_slot"],
                 "domain_match": score_parts["domain_match"],
                 "lexical_norm": lexical_norm,
                 "reliability": reliability,
@@ -2023,6 +2079,7 @@ Rules:
                 "global_bm25": weights["global_bm25"] * score_inputs["global_bm25"],
                 "global_entity": weights["global_entity"] * score_inputs["global_entity"],
                 "graph_expansion": weights["graph_expansion"] * score_inputs["graph_expansion"],
+                "answer_slot": weights["answer_slot"] * score_inputs["answer_slot"],
                 "domain_match": weights["domain_match"] * score_inputs["domain_match"],
                 "lexical": weights["lexical"] * score_inputs["lexical_norm"],
                 "reliability": 0.07 * score_inputs["reliability"],
@@ -2043,6 +2100,7 @@ Rules:
             debug_parts["score_weights"] = dict(weights)
             debug_parts["score_inputs"] = score_inputs
             debug_parts["score_contributions"] = score_contributions
+            debug_parts["graph_expansion_enabled"] = ENABLE_GRAPH_EXPANSION
             debug_parts["dia_id"] = self._dia_id_for_memory(memory)
             debug_parts["memory_id"] = memory.id
             candidate_scores[idx] = debug_parts
@@ -2057,7 +2115,7 @@ Rules:
         rank_components = [
             "domain_embedding", "domain_bm25", "domain_lexical",
             "global_embedding", "global_bm25", "global_entity",
-            "graph_expansion", "domain_match", "lexical_norm",
+            "graph_expansion", "answer_slot", "domain_match", "lexical_norm",
             "reliability_score", "citation_score", "combined_score",
         ]
         for component in rank_components:
@@ -2567,6 +2625,8 @@ Rules:
             memory.last_updated = getattr(memory, "last_accessed", getattr(memory, "timestamp", ""))
         if not hasattr(memory, "rewrite_content"):
             memory.rewrite_content = ""
+        if not hasattr(memory, "rewrite_version"):
+            memory.rewrite_version = ""
         self._ensure_rewrite_content(memory)
         return memory
 
@@ -2801,7 +2861,7 @@ Rules:
                     -float(edge.get("strength", 0.0)) if isinstance(edge, dict) else 0.0,
                 ),
             )
-            if not allow_expansion:
+            if not allow_expansion or not ENABLE_GRAPH_EXPANSION:
                 sorted_edges = []
             direct_context_relations = {
                 "similar_event", "same_character", "same_storyline", "image_text_pair",
@@ -3124,6 +3184,7 @@ Rules:
         old_memory.content = content
         old_memory.current_content = content
         old_memory.rewrite_content = self._rewrite_memory_content(old_memory)
+        old_memory.rewrite_version = REWRITE_CONTENT_VERSION
         old_memory.context = new_memory.context or old_memory.context
         old_memory.keywords = self._merge_unique(old_memory.keywords, new_memory.keywords)
         old_memory.tags = self._merge_unique(old_memory.tags, new_memory.tags)

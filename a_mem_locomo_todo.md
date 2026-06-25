@@ -94,7 +94,7 @@ final evidence context beyond the v18 top-10 setting.
 
 ### Current Active Version: v20_retrieval_only_debug
 
-Status: superseded by v21_disable_cat1_coverage_ablation
+Status: superseded by v21_answer_slot_rewrite_no_graph
 
 Reason:
 
@@ -119,7 +119,7 @@ against answer-level F1 or LLM-judge runs.
 
 ### Current Active Version: v21_disable_cat1_coverage_ablation
 
-Status: active experiment
+Status: deferred
 
 Reason:
 
@@ -139,6 +139,34 @@ Important constraint:
 
 This is an ablation switch. Do not permanently remove coverage rerank until the
 retrieval-only result proves disabling it improves Cat1 hit_all.
+
+---
+
+### Current Active Version: v21_answer_slot_rewrite_no_graph
+
+Status: active experiment
+
+Reason:
+
+The source ablation and follow-up retrieval-only run indicate that
+`graph_expansion` is weak as a standalone signal and slightly hurts Cat1 when
+used as part of the current retrieval mechanism.
+
+Implemented repair:
+
+```text
+disable graph_expansion globally
+keep local_context expansion
+rewrite_content becomes answer-slot-oriented
+add global answer_slot retrieval contribution
+force old generic rewrite_content to regenerate via rewrite version
+```
+
+Important constraint:
+
+The answer-slot rewrite and ranking signal are shared across all categories,
+not a Cat1-only branch. This keeps the mechanism aligned with the paper's main
+memory-representation story rather than adding a category-specific patch.
 
 ---
 

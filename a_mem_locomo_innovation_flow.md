@@ -2372,6 +2372,106 @@ v20_retrieval_only_debug
 
 ---
 
+## 22. v21 Answer-Slot Rewrite and No-Graph Retrieval
+
+### Motivation
+
+The source ablation showed that `graph_expansion` is a weak standalone signal.
+Disabling the graph-assisted mechanism slightly improved Cat1 retrieval while
+leaving Cat2 unchanged in the user's follow-up run:
+
+```text
+Cat1: hit_any 59, hit_all 26
+Cat2: hit_any 83, hit_all 83
+```
+
+This suggests that the current graph expansion is not a reliable rescue
+mechanism for multi-evidence Cat1 questions. The stronger direction is to make
+the node text itself more answer-slot aligned so lexical/BM25/entity retrieval
+can rank evidence items more directly.
+
+### Implemented Changes
+
+v21 disables graph expansion globally:
+
+```text
+ENABLE_GRAPH_EXPANSION = False
+graph_expansion fusion weights = 0
+graph-edge context expansion disabled
+local_context expansion remains available
+```
+
+v21 also changes memory rewriting from a generic self-contained sentence to an
+answer-slot evidence sentence. The rewrite prompt now asks the model to expose
+slots such as:
+
+```text
+activity
+event
+place
+person
+support source
+object/item
+book/media
+art subject
+music artist/band
+pet/name
+identity/status
+relationship
+career/goal
+count fact
+temporal fact
+preference/trait
+```
+
+Preferred rewrite shape:
+
+```text
+Subject slot: item; qualifier; time
+```
+
+### Global Answer-Slot Ranking Signal
+
+This is not Cat1-only. The retrieval fusion now includes a global
+question-conditioned `answer_slot` score over `rewrite_content`.
+
+The signal checks whether:
+
+```text
+the question implies an answer slot
+the rewritten memory exposes the same slot label or slot words
+the rewritten memory overlaps question target terms
+```
+
+The new score appears in diagnostics as:
+
+```text
+score_inputs.answer_slot
+score_contributions.answer_slot
+source_ranks.answer_slot
+source_tags includes answer_slot
+```
+
+### Cache Note
+
+The cache versions are bumped so old generic rewrites do not remain active:
+
+```text
+robust_retrieval_v9_answer_slot_rewrite_no_graph
+domain_graph_v8_answer_slot_rewrite
+rewrite_content version: answer_slot_rewrite_v1
+```
+
+### Version Tag
+
+Use this experiment label:
+
+```text
+v21_answer_slot_rewrite_no_graph
+```
+
+---
+
 ## 22. v21 Cat1 Coverage Rerank Ablation
 
 ### Motivation
